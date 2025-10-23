@@ -207,8 +207,8 @@ final class SpectralAudioEngine: ObservableObject {
         vDSP_vsmul(ifftReal, 1, &gain, &ifftReal, 1, vDSP_Length(fftSize))
 
         let theta = (pan + 1) * Float.pi * 0.25 // -1..+1 → 0..π/2
-        let gL = cos(theta)
-        let gR = sin(theta)
+        let gL = sin(theta) // swapped to flip L/R
+        let gR = cos(theta)
 
         // 7) Overlap-add write
         for i in 0..<fftSize {
