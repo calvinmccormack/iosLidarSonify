@@ -146,7 +146,7 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         for r in 0..<Self.gridHeight {
             // flip vertically so index 0 = bottom
             let gy = (Self.gridHeight - 1 - r)
-            let d = grid[gy * Self.gridWidth + col]
+            let d = grid[gy * Self.gridWidth + (Self.gridWidth - 1 - col)]
             // Normalize depth: near→1, far→0 (invert because nearer = louder)
             let t = clamp01(1 - (d - nearMeters) / max(0.001, (farMeters - nearMeters)))
             // Map to linear gain via dB range (0 dB down to -gainRangeDB)
