@@ -31,8 +31,8 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     private var sweepSeconds: Double = 2.0
     private var sweepStart = Date()
 
-    // Callback: column envelope + pan
-    private var onColumn: ((Int, [Float], Float) -> Void)?
+    // Callback: column envelope + pan + z (0 near…1 far) + edge strength (0…1)
+    private var onColumn: ((Int, [Float], Float, Float, Float) -> Void)?
 
     // FPS measure
     private var lastTime = Date()
@@ -46,7 +46,7 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         session.run(config)
     }
 
-    func start(sweepSeconds: Double, onColumn: @escaping (Int, [Float], Float) -> Void) {
+    func start(sweepSeconds: Double, onColumn: @escaping (Int, [Float], Float, Float, Float) -> Void) {
         self.onColumn = onColumn
         self.sweepSeconds = sweepSeconds
         self.sweepStart = Date()
@@ -80,7 +80,12 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         // Pan: +1 at right → -1 at left to match visual
         let norm = Double(col) / maxCol       // 1 → 0 over sweep
         let pan = Float(norm * 2 - 1)         // +1 → -1
-        onColumn?(col, env, pan)
+
+        // Distance & edge strength for this (mirrored) column
+        let z01 = columnZ01(col: col)
+        let edge01 = columnEdge01(col: col)
+
+        onColumn?(col, env, pan, z01, edge01)
 
         if let img = debugImageFromGrid() { debugImage = img }
     }
@@ -158,6 +163,40 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         return env
     }
 
+    private func columnZ01(col: Int) -> Float {
+        // Mirror horizontally to match columnEnvelope’s mirroring
+        let W = Self.gridWidth
+        let H = Self.gridHeight
+        let cm = (W - 1 - col)
+        gridLock.lock(); defer { gridLock.unlock() }
+        var acc: Float = 0
+        let range = max(0.001, (farMeters - nearMeters))
+        for y in 0..<H {
+            let d = grid[y * W + cm]
+            let t = clamp01((d - nearMeters) / range) // 0 near → 1 far
+            acc += t
+        }
+        return acc / Float(H)
+    }
+
+    private func columnEdge01(col: Int) -> Float {
+        // Mirror horizontally to match columnEnvelope’s mirroring
+        let W = Self.gridWidth
+        let H = Self.gridHeight
+        let cm = (W - 1 - col)
+        let c1 = min(W - 1, cm + 1)
+        gridLock.lock(); defer { gridLock.unlock() }
+        var acc: Float = 0
+        for y in 0..<H {
+            let a = grid[y * W + cm]
+            let b = grid[y * W + c1]
+            acc += abs(b - a)
+        }
+        let mean = acc / Float(H)
+        let norm = mean / max(0.001, (farMeters - nearMeters))
+        return clamp01(norm * 4) // amplify a bit
+    }
+
     private func smoothInPlace(_ x: inout [Float], a: Float) {
         guard x.count > 1 else { return }
         var prev = x[0]
@@ -202,4 +241,3 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
 }
 
 @inline(__always) private func clamp01(_ x: Float) -> Float { max(0, min(1, x)) }
-

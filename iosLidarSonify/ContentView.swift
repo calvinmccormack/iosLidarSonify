@@ -10,6 +10,8 @@ struct ContentView: View {
     @State private var fMin: Double = 50
     @State private var fMax: Double = 10050
     @State private var gainRangeDB: Double = 24
+    @State private var mode: SpectralAudioEngine.SourceMode = .square
+    
 
     var body: some View {
         GeometryReader { geo in
@@ -26,7 +28,7 @@ struct ContentView: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .border(Color.gray)
 
-                        // Full-height scan bar moving RIGHT → LEFT
+                        // Full-height scan bar moving LEFT → RIGHT
                         GeometryReader { g in
                             let norm = CGFloat(depthPipeline.scanColumn) / CGFloat(DepthPipeline.gridWidth - 1)
                             let x = (1 - norm) * g.size.width
@@ -57,6 +59,16 @@ struct ContentView: View {
                         Spacer()
                     }
 
+                    Picker("Source", selection: $mode) {
+                        ForEach(SpectralAudioEngine.SourceMode.allCases) { m in
+                            Text(m.label).tag(m)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .onChange(of: mode) { _, newMode in
+                        audio.sourceMode = newMode
+                    }
+
                     Group {
                         LabeledSlider(title: "Sweep (s)", value: $sweepSeconds, range: 0.5...8.0, format: "%.1f")
                         LabeledSlider(title: "Min Hz", value: $fMin, range: 20...500, format: "%.0f")
@@ -79,7 +91,10 @@ struct ContentView: View {
         .overlay(
             ARDepthCaptureView(pipeline: depthPipeline).frame(width: 0, height: 0)
         )
-        .onAppear { audio.configureBands(fMin: fMin, fMax: fMax) }
+        .onAppear {
+            audio.configureBands(fMin: fMin, fMax: fMax)
+            audio.sourceMode = mode
+        }
         .onChange(of: fMin) { _, v in audio.configureBands(fMin: v, fMax: fMax) }
         .onChange(of: fMax) { _, v in audio.configureBands(fMin: fMin, fMax: v) }
         .onChange(of: gainRangeDB) { _, v in depthPipeline.gainRangeDB = Float(v) }
@@ -88,9 +103,11 @@ struct ContentView: View {
     private func start() {
         guard ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) else { return }
         audio.start()
-        depthPipeline.start(sweepSeconds: sweepSeconds) { _, envelope, pan in
+        depthPipeline.start(sweepSeconds: sweepSeconds) { _, envelope, pan, z01, edge01 in
             audio.updateEnvelope(envelope)
             audio.pan = pan
+            audio.updateDistance(z01)   // drives LPF and reverb send
+            audio.triggerEdge(edge01)   // short click overlay on edges
         }
         isRunning = true
     }
