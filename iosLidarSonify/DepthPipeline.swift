@@ -93,8 +93,17 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         let pan = Float(norm * 2 - 1)         // +1 → -1
 
         // Distance & edge strength for this (mirrored) column
-        let z01 = columnZ01(col: col)
+        var z01 = columnZ01(col: col)
         let edge01 = columnEdge01(col: col)
+
+        // Target coverage in this column (0..1 of vertical cells belonging to targetClass)
+        let targetCov = columnTargetCoverage(col: col)
+        print("scan col \(col), targetCov = \(targetCov)")
+
+        // Simple target-based boost: when target coverage is high, pull z01 slightly "closer"
+        // so the target feels more foreground in the sonification.
+        let boost: Float = targetCov * 0.3
+        z01 = clamp01(z01 - boost)
 
         onColumn?(col, env, pan, z01, edge01)
 
@@ -173,6 +182,16 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         gridLock.lock()
         classGrid = newGrid
         gridLock.unlock()
+
+        // DEBUG: print class distribution in the 60x40 grid
+        var hist = [Int](repeating: 0, count: 6)
+        for v in newGrid {
+            let idx = Int(v)
+            if idx >= 0 && idx < hist.count {
+                hist[idx] += 1
+            }
+        }
+        print("classGrid histogram:", hist)
     }
 
     // Downsample depth to 60x40 by average pooling per cell
@@ -229,6 +248,24 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         // Optional smoothing across bands to reduce combing
         smoothInPlace(&env, a: 0.6)
         return env
+    }
+
+    private func columnTargetCoverage(col: Int) -> Float {
+        // Mirror horizontally to match columnEnvelope’s mirroring
+        let W = Self.gridWidth
+        let H = Self.gridHeight
+        let cm = (W - 1 - col)
+
+        gridLock.lock(); defer { gridLock.unlock() }
+
+        var countTarget = 0
+        for y in 0..<H {
+            let idx = y * W + cm
+            if classGrid[idx] == targetClass {
+                countTarget += 1
+            }
+        }
+        return Float(countTarget) / Float(H)
     }
 
     private func columnZ01(col: Int) -> Float {
