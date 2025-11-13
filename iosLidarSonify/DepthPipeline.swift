@@ -169,8 +169,10 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                 var yy = y0
                 while yy < y1 {
                     var xx = x0
+                    // Flip Y to match depth grid orientation
+                    let flippedY = (H - 1 - yy)
                     while xx < x1 {
-                        let cls = Int(mask[yy * W + xx])
+                        let cls = Int(mask[flippedY * W + xx])
                         if cls >= 0 && cls < counts.count {
                             counts[cls] += 1
                         }
@@ -322,29 +324,63 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     private func debugImageFromGrid() -> UIImage? {
-        // Render 60x40 as grayscale for dev UI
+        // Render 60x40: grayscale depth, with non-background segmentation cells tinted blue
         let W = Self.gridWidth
         let H = Self.gridHeight
         let scale: CGFloat = 4
-        let size = CGSize(width: CGFloat(W), height: CGFloat(H))
 
-        // Normalize grid to 0..1 from near..far (closer=brighter)
-        var pixels = [UInt8](repeating: 0, count: W * H)
+        // Build RGBA buffer
+        var rgba = [UInt8](repeating: 0, count: W * H * 4)
+
         gridLock.lock()
+        let range = max(0.001, (farMeters - nearMeters))
         for y in 0..<H {
             for x in 0..<W {
-                let d = grid[y * W + x]
-                let t = clamp01(1 - (d - nearMeters) / max(0.001, (farMeters - nearMeters)))
-                pixels[y * W + x] = UInt8(t * 255)
+                let idx = y * W + x
+                let d = grid[idx]
+                // Normalize depth: near→1, far→0 (closer=brighter)
+                let t = clamp01(1 - (d - nearMeters) / range)
+                let gray = UInt8(t * 255)
+
+                let cls = classGrid[idx]
+                let base = idx * 4
+
+                if cls > 0 {
+                    // Non-background: tint blue
+                    rgba[base + 0] = 0          // R
+                    rgba[base + 1] = 0          // G
+                    rgba[base + 2] = max(gray, 128) // B, at least moderately bright
+                    rgba[base + 3] = 255        // A
+                } else {
+                    // Background: grayscale
+                    rgba[base + 0] = gray       // R
+                    rgba[base + 1] = gray       // G
+                    rgba[base + 2] = gray       // B
+                    rgba[base + 3] = 255        // A
+                }
             }
         }
         gridLock.unlock()
 
-        let cfData = CFDataCreate(nil, pixels, pixels.count)!
+        let bytesPerRow = W * 4
+        let cfData = CFDataCreate(nil, rgba, rgba.count)!
         let provider = CGDataProvider(data: cfData)!
-        let cs = CGColorSpaceCreateDeviceGray()
-        if let cg = CGImage(width: W, height: H, bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: W, space: cs, bitmapInfo: CGBitmapInfo(rawValue: 0), provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent) {
-            return UIImage(cgImage: cg, scale: 1.0/scale, orientation: .up)
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+
+        if let cg = CGImage(width: W,
+                            height: H,
+                            bitsPerComponent: 8,
+                            bitsPerPixel: 32,
+                            bytesPerRow: bytesPerRow,
+                            space: cs,
+                            bitmapInfo: bitmapInfo,
+                            provider: provider,
+                            decode: nil,
+                            shouldInterpolate: false,
+                            intent: .defaultIntent) {
+            // scale is handled by UIKit when drawing; keep 1.0 here
+            return UIImage(cgImage: cg, scale: 1.0 / scale, orientation: .up)
         }
         return nil
     }
