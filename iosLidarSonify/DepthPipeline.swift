@@ -25,6 +25,17 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     private var grid = [Float](repeating: 0, count: gridWidth * gridHeight)
     private let gridLock = NSLock()
 
+    // Segmentation: downsampled class grid aligned with depth grid
+    private let segmentationModel = ObjectSegmentation()
+    private var lastSegmentationTime: TimeInterval = 0
+    private let segmentationInterval: TimeInterval = 0.15 // seconds, ~6–7 Hz
+
+    // Class IDs per 60x40 cell (from segmentation)
+    private var classGrid = [UInt8](repeating: 0, count: gridWidth * gridHeight)
+
+    // Target class for object-aware sonification (placeholder)
+    var targetClass: UInt8 = 1
+
     // Sweep
     private var displayLink: CADisplayLink?
     private var sweepTimer: Timer?
@@ -96,6 +107,13 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         guard let depthPB = frame.sceneDepth?.depthMap else { return }
         updateGrid(from: depthPB)
 
+        // Run segmentation at a lower rate than AR frame rate
+        let nowTime = frame.timestamp
+        if nowTime - lastSegmentationTime > segmentationInterval {
+            lastSegmentationTime = nowTime
+            runSegmentation(on: frame)
+        }
+
         // FPS estimate from AR callback
         frameCount += 1
         let now = Date()
@@ -105,6 +123,56 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
             frameCount = 0
             lastTime = now
         }
+    }
+
+    // MARK: - Segmentation helpers
+
+    private func runSegmentation(on frame: ARFrame) {
+        segmentationModel?.predictMask(from: frame) { [weak self] mask, width, height in
+            guard let self = self,
+                  let mask = mask,
+                  width > 0, height > 0 else { return }
+
+            self.updateClassGrid(from: mask, maskWidth: width, maskHeight: height)
+        }
+    }
+
+    private func updateClassGrid(from mask: [UInt8], maskWidth W: Int, maskHeight H: Int) {
+        guard mask.count == W * H else { return }
+
+        var newGrid = [UInt8](repeating: 0, count: Self.gridWidth * Self.gridHeight)
+
+        for gy in 0..<Self.gridHeight {
+            let y0 = gy * H / Self.gridHeight
+            let y1 = min((gy + 1) * H / Self.gridHeight, H)
+
+            for gx in 0..<Self.gridWidth {
+                let x0 = gx * W / Self.gridWidth
+                let x1 = min((gx + 1) * W / Self.gridWidth, W)
+
+                // Majority vote for class in this cell
+                var counts = [Int](repeating: 0, count: 6) // 6 classes in MiniUNetHW6
+                var yy = y0
+                while yy < y1 {
+                    var xx = x0
+                    while xx < x1 {
+                        let cls = Int(mask[yy * W + xx])
+                        if cls >= 0 && cls < counts.count {
+                            counts[cls] += 1
+                        }
+                        xx += 1
+                    }
+                    yy += 1
+                }
+
+                let (bestClass, _) = counts.enumerated().max(by: { $0.element < $1.element }) ?? (0, 0)
+                newGrid[gy * Self.gridWidth + gx] = UInt8(bestClass)
+            }
+        }
+
+        gridLock.lock()
+        classGrid = newGrid
+        gridLock.unlock()
     }
 
     // Downsample depth to 60x40 by average pooling per cell
