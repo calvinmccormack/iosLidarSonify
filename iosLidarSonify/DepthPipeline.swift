@@ -29,6 +29,7 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     private let segmentationModel = ObjectSegmentation()
     private var lastSegmentationTime: TimeInterval = 0
     private let segmentationInterval: TimeInterval = 0.15 // seconds, ~6–7 Hz
+    private var isSegmentationRunning: Bool = false
 
     // Class IDs per 60x40 cell (from segmentation)
     private var classGrid = [UInt8](repeating: 0, count: gridWidth * gridHeight)
@@ -137,9 +138,13 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     // MARK: - Segmentation helpers
 
     private func runSegmentation(on frame: ARFrame) {
+        guard !isSegmentationRunning else { return }
+        isSegmentationRunning = true
         segmentationModel?.predictMask(from: frame) { [weak self] mask, width, height in
-            guard let self = self,
-                  let mask = mask,
+            guard let self = self else { return }
+            defer { self.isSegmentationRunning = false }
+
+            guard let mask = mask,
                   width > 0, height > 0 else { return }
 
             self.updateClassGrid(from: mask, maskWidth: width, maskHeight: height)
