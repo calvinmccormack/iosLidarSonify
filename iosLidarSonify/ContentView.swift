@@ -78,10 +78,19 @@ struct ContentView: View {
 
                     Spacer()
 
-                    Text("Col \(depthPipeline.scanColumn + 1)/\(DepthPipeline.gridWidth) • Pan \(String(format: "%.2f", audio.pan)) • FPS \(String(format: "%.1f", depthPipeline.fps))")
+                    let colText = "Col \(depthPipeline.scanColumn + 1)/\(DepthPipeline.gridWidth)"
+                    let panText = String(format: "%.2f", audio.pan)
+                    let fpsText = String(format: "%.1f", depthPipeline.fps)
+                    Text("\(colText) • Pan \(panText) • FPS \(fpsText)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                    
+                    Text(depthPipeline.classHistogramText)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                    
                 }
                 .frame(width: geo.size.width * 0.34, height: geo.size.height)
             }

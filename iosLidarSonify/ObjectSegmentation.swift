@@ -73,7 +73,7 @@ final class ObjectSegmentation {
 
         // ARKit camera buffer orientation; .right usually correct for portrait
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
-                                            orientation: .right,
+                                            orientation: .up,
                                             options: [:])
 
         queue.async {

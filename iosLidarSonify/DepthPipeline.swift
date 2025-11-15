@@ -12,6 +12,7 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     @Published var debugImage: UIImage?
     @Published var fps: Double = 0
     @Published var scanColumn: Int = 0
+    @Published var classHistogramText: String = "classGrid histogram: []"
 
     // Mapping
     var nearMeters: Float = 0.30
@@ -169,16 +170,14 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                 var yy = y0
                 while yy < y1 {
                     var xx = x0
-                    // Flip Y to match depth grid orientation
-                    let flippedY = (H - 1 - yy)
-                    while xx < x1 {
-                        let cls = Int(mask[flippedY * W + xx])
-                        if cls >= 0 && cls < counts.count {
-                            counts[cls] += 1
+                        while xx < x1 {
+                            let cls = Int(mask[yy * W + xx])
+                            if cls >= 0 && cls < counts.count {
+                                counts[cls] += 1
+                            }
+                            xx += 1
                         }
-                        xx += 1
-                    }
-                    yy += 1
+                        yy += 1
                 }
 
                 let (bestClass, _) = counts.enumerated().max(by: { $0.element < $1.element }) ?? (0, 0)
@@ -199,6 +198,11 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
             }
         }
         print("classGrid histogram:", hist)
+        
+        // Update published text for UI
+        DispatchQueue.main.async {
+            self.classHistogramText = "classGrid histogram: \(hist)"
+        }
     }
 
     // Downsample depth to 60x40 by average pooling per cell
