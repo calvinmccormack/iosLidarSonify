@@ -1,0 +1,21 @@
+name: hw3
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.9
+  - trimesh=4.0.4
+  - numpy=1.23.5
+  - py-opencv=4.5.5
+  - scipy=1.8.0
+  - pandas=1.4.1
+  - matplotlib=3.5.1
+  - tqdm=4.63
+  - scikit-image=0.19.2
+  - imgaug=0.4.0
+  - pytorch=2.1.0
+  - torchvision=0.16.0
+  - pytorch-cuda=11.8
+  - pybullet==3.25
+  - mkl<2024.1.0 # see https://github.com/pytorch/pytorch/issues/123097

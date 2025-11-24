@@ -3,6 +3,8 @@ import ARKit
 import UIKit
 import Accelerate
 import Combine
+import Vision
+import CoreML
 
 final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     static let gridWidth = 60
@@ -10,6 +12,7 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
 
     // Public outputs
     @Published var debugImage: UIImage?
+    @Published var segOverlay: UIImage? = nil
     @Published var fps: Double = 0
     @Published var scanColumn: Int = 0
     @Published var classHistogramText: String = "classGrid histogram: []"
@@ -114,7 +117,8 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
 
 
     // MARK: ARSessionDelegate
-    func session(_ session: ARSession, didUpdate frame: ARFrame) {
+
+    private func handleFrame(_ frame: ARFrame) {
         guard let depthPB = frame.sceneDepth?.depthMap else { return }
         updateGrid(from: depthPB)
 
@@ -134,6 +138,23 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
             frameCount = 0
             lastTime = now
         }
+
+        // Update published overlay from the current debug grid render
+        if let img = debugImageFromGrid() {
+            DispatchQueue.main.async {
+                self.segOverlay = img
+                self.debugImage = img
+            }
+        }
+    }
+
+    func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        handleFrame(frame)
+    }
+
+    /// Public entry for external ARSession delegates to forward frames here.
+    func process(frame: ARFrame) {
+        handleFrame(frame)
     }
 
     // MARK: - Segmentation helpers
@@ -165,8 +186,8 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                 let x0 = gx * W / Self.gridWidth
                 let x1 = min((gx + 1) * W / Self.gridWidth, W)
 
-                // Majority vote for class in this cell
-                var counts = [Int](repeating: 0, count: 6) // 6 classes in MiniUNetHW6
+                // Majority vote for class in this cell (our model: 4 classes = bg/sphere/tetra/cube)
+                var counts = [Int](repeating: 0, count: 4)
                 var yy = y0
                 while yy < y1 {
                     var xx = x0
@@ -189,19 +210,19 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         classGrid = newGrid
         gridLock.unlock()
 
-        // DEBUG: print class distribution in the 60x40 grid
-        var hist = [Int](repeating: 0, count: 6)
+        // DEBUG: class distribution in the 60x40 grid (4 classes)
+        var hist = [Int](repeating: 0, count: 4)
         for v in newGrid {
             let idx = Int(v)
             if idx >= 0 && idx < hist.count {
                 hist[idx] += 1
             }
         }
-        print("classGrid histogram:", hist)
+        print("classGrid histogram (bg, sphere, tetra, cube):", hist)
         
         // Update published text for UI
         DispatchQueue.main.async {
-            self.classHistogramText = "classGrid histogram: \(hist)"
+            self.classHistogramText = "bg: \(hist[0])  sp: \(hist[1])  te: \(hist[2])  cu: \(hist[3])"
         }
     }
 
@@ -349,18 +370,38 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                 let cls = classGrid[idx]
                 let base = idx * 4
 
-                if cls > 0 {
-                    // Non-background: tint blue
-                    rgba[base + 0] = 0          // R
-                    rgba[base + 1] = 0          // G
-                    rgba[base + 2] = max(gray, 128) // B, at least moderately bright
-                    rgba[base + 3] = 255        // A
-                } else {
+                if cls == 0 {
                     // Background: grayscale
                     rgba[base + 0] = gray       // R
                     rgba[base + 1] = gray       // G
                     rgba[base + 2] = gray       // B
                     rgba[base + 3] = 255        // A
+                } else {
+                    // Foreground classes with color coding
+                    // sphere=1 → red, tetra=2 → green, cube=3 → blue
+                    let overlayAlpha: Float = 0.55
+                    let grayF = Float(gray)
+                    var r: Float = grayF, g: Float = grayF, b: Float = grayF
+                    switch cls {
+                    case 1: // sphere → red
+                        r = max(grayF, 200)
+                        g = grayF * (1.0 - overlayAlpha)
+                        b = grayF * (1.0 - overlayAlpha)
+                    case 2: // tetra → green
+                        r = grayF * (1.0 - overlayAlpha)
+                        g = max(grayF, 200)
+                        b = grayF * (1.0 - overlayAlpha)
+                    case 3: // cube → blue
+                        r = grayF * (1.0 - overlayAlpha)
+                        g = grayF * (1.0 - overlayAlpha)
+                        b = max(grayF, 200)
+                    default:
+                        break
+                    }
+                    rgba[base + 0] = UInt8(min(255, r))
+                    rgba[base + 1] = UInt8(min(255, g))
+                    rgba[base + 2] = UInt8(min(255, b))
+                    rgba[base + 3] = 255
                 }
             }
         }

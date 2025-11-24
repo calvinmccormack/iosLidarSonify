@@ -11,6 +11,8 @@ struct ContentView: View {
     @State private var fMax: Double = 10050
     @State private var gainRangeDB: Double = 24
     @State private var mode: SpectralAudioEngine.SourceMode = .square
+    @State private var showSeg: Bool = true
+    @State private var segAlpha: Double = 0.55
     
 
     var body: some View {
@@ -27,6 +29,17 @@ struct ContentView: View {
                             .aspectRatio(4.0/3.0, contentMode: .fit)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .border(Color.gray)
+
+                        if showSeg, let seg = depthPipeline.segOverlay {
+                            Image(uiImage: seg)
+                                .resizable()
+                                .interpolation(.none)
+                                .scaledToFit()
+                                .aspectRatio(4.0/3.0, contentMode: .fit)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .opacity(segAlpha)
+                                .allowsHitTesting(false)
+                        }
 
                         // Full-height scan bar moving LEFT → RIGHT
                         GeometryReader { g in
@@ -75,6 +88,25 @@ struct ContentView: View {
                         LabeledSlider(title: "Max Hz", value: $fMax, range: 2000...20000, format: "%.0f")
                         LabeledSlider(title: "Atten (dB)", value: $gainRangeDB, range: 6...48, format: "%.0f")
                     }
+
+                    // Segmentation overlay controls
+                    Toggle("Seg Overlay", isOn: $showSeg)
+
+                    HStack {
+                        Text("Overlay α").frame(width: 90, alignment: .leading)
+                        Slider(value: $segAlpha, in: 0...1)
+                        Text(String(format: "%.2f", segAlpha))
+                            .monospacedDigit()
+                            .frame(width: 60, alignment: .trailing)
+                    }
+
+                    // Legend for classes: red=sphere, green=tetra, blue=cube
+                    HStack(spacing: 8) {
+                        LegendSwatch(color: .red);   Text("Sphere").font(.caption)
+                        LegendSwatch(color: .green); Text("Tetra").font(.caption)
+                        LegendSwatch(color: .blue);  Text("Cube").font(.caption)
+                    }
+                    .opacity(showSeg ? 1 : 0.3)
 
                     Spacer()
 
@@ -143,5 +175,15 @@ private struct LabeledSlider: View {
                 .monospacedDigit()
                 .frame(width: 60, alignment: .trailing)
         }
+    }
+}
+
+private struct LegendSwatch: View {
+    let color: Color
+    var body: some View {
+        Rectangle()
+            .fill(color)
+            .frame(width: 12, height: 12)
+            .cornerRadius(2)
     }
 }

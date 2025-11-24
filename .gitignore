@@ -1,0 +1,44 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.ipynb_checkpoints/
+
+# ==== TRAINING DATA (skip the big stuff) ====
+shape_training/raw_photos/
+shape_training/segmented_photos/
+shape_training/dataset/
+shape_training/pred_overlays/
+shape_training/runs/
+shape_training/*.pt
+shape_training/*.pth
+shape_training/*.ckpt
+shape_training/*.npz
+shape_training/*.npy
+shape_training/*.mlmodel
+shape_training/*.mlmodelc
+shape_training/*.mlpackage
+
+# ==== MODELS: ignore by default, but KEEP iOS app's Models folder ====
+*.mlmodel
+*.mlmodelc
+*.mlpackage
+!iosLidarSonify/Models/**
+!iosLidarSonify/iosLidarSonify/Models/**
+
+# Xcode cruft / build products
+**/xcuserdata/
+**/DerivedData/
+*.xcuserstate
+*.xcscmblueprint
+build/
+Build/
+*.dSYM
+*.ipa
+
+# Envs / misc
+.venv/
+.env
+*.log

@@ -1,0 +1,21 @@
+# use if you have an Apple computer with an M series chip to take advantage of GPU acceleration
+name: hw3
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.9
+  - trimesh=4.0.4
+  - numpy=1.23.5
+  - opencv=4.5.5
+  - scipy=1.8.0
+  - pandas=1.4.1
+  - matplotlib=3.5.0
+  - tqdm=4.65.0
+  - scikit-image=0.19.2
+  - imgaug=0.4.0
+  - libjpeg-turbo=2.1.0 # not necessary but torch raises annoying warnings w/o it
+  - pytorch=2.5.0
+  - torchvision=0.20.0
+  - pybullet=3.25
+

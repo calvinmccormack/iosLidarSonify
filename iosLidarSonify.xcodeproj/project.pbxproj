@@ -15,16 +15,28 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
+				ShapeSeg_unet_mbv2_best.mlpackage,
 			);
 			target = 31F803D22EAA236100F61620 /* iosLidarSonify */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
+		31F55AA32ED3B22B00C2FCB1 /* Exceptions for "iosLidarSonify" folder in "Copy Bundle Resources" phase from "iosLidarSonify" target */ = {
+			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
+			buildPhase = 31F803D12EAA236100F61620 /* Resources */;
+			membershipExceptions = (
+				ShapeSeg_unet_mbv2_best.mlpackage,
+			);
+		};
+/* End PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		31F803D52EAA236100F61620 /* iosLidarSonify */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
 				317887AD2EAABD2C001C699A /* Exceptions for "iosLidarSonify" folder in "iosLidarSonify" target */,
+				31F55AA32ED3B22B00C2FCB1 /* Exceptions for "iosLidarSonify" folder in "Copy Bundle Resources" phase from "iosLidarSonify" target */,
 			);
 			path = iosLidarSonify;
 			sourceTree = "<group>";
