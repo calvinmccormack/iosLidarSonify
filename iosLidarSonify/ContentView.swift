@@ -10,9 +10,6 @@ struct ContentView: View {
     @State private var fMin: Double = 50
     @State private var fMax: Double = 10050
     @State private var gainRangeDB: Double = 24
-    @State private var showSeg: Bool = true
-    @State private var segAlpha: Double = 0.55
-    
 
     var body: some View {
         GeometryReader { geo in
@@ -20,36 +17,14 @@ struct ContentView: View {
                 // LEFT: Preview (≈ 2/3 width)
                 ZStack(alignment: .topLeading) {
                     if let image = depthPipeline.debugImage {
+                        // Single unified image: depth + segmentation overlay + scan line
                         Image(uiImage: image)
                             .resizable()
                             .interpolation(.none)
                             .scaledToFit()
-                            // Keep LiDAR depth ~4:3 in a landscape space
                             .aspectRatio(4.0/3.0, contentMode: .fit)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .border(Color.gray)
-
-                        if showSeg, let seg = depthPipeline.segOverlay {
-                            Image(uiImage: seg)
-                                .resizable()
-                                .interpolation(.none)
-                                .scaledToFit()
-                                .aspectRatio(4.0/3.0, contentMode: .fit)
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                                .opacity(segAlpha)
-                                .allowsHitTesting(false)
-                        }
-
-                        // Full-height scan bar moving LEFT → RIGHT
-                        GeometryReader { g in
-                            let norm = CGFloat(depthPipeline.scanColumn) / CGFloat(DepthPipeline.gridWidth - 1)
-                            let x = (1 - norm) * g.size.width
-                            Rectangle()
-                                .fill(Color.red.opacity(0.85))
-                                .frame(width: 2, height: g.size.height)
-                                .position(x: x, y: g.size.height / 2)
-                        }
-                        .allowsHitTesting(false)
                     } else {
                         Text("Waiting for depth…")
                             .foregroundStyle(.secondary)
@@ -71,7 +46,6 @@ struct ContentView: View {
                         Spacer()
                     }
 
-
                     Group {
                         LabeledSlider(title: "Sweep (s)", value: $sweepSeconds, range: 0.5...8.0, format: "%.1f")
                         LabeledSlider(title: "Min Hz", value: $fMin, range: 20...500, format: "%.0f")
@@ -79,24 +53,15 @@ struct ContentView: View {
                         LabeledSlider(title: "Atten (dB)", value: $gainRangeDB, range: 6...48, format: "%.0f")
                     }
 
-                    // Segmentation overlay controls
-                    Toggle("Seg Overlay", isOn: $showSeg)
-
-                    HStack {
-                        Text("Overlay α").frame(width: 90, alignment: .leading)
-                        Slider(value: $segAlpha, in: 0...1)
-                        Text(String(format: "%.2f", segAlpha))
-                            .monospacedDigit()
-                            .frame(width: 60, alignment: .trailing)
-                    }
-
                     // Legend for classes: red=sphere, green=tetra, blue=cube
-                    HStack(spacing: 8) {
-                        LegendSwatch(color: .red);   Text("Sphere").font(.caption)
-                        LegendSwatch(color: .green); Text("Tetra").font(.caption)
-                        LegendSwatch(color: .blue);  Text("Cube").font(.caption)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Segmentation:").font(.caption).foregroundStyle(.secondary)
+                        HStack(spacing: 8) {
+                            LegendSwatch(color: .red);   Text("Sphere").font(.caption)
+                            LegendSwatch(color: .green); Text("Tetra").font(.caption)
+                            LegendSwatch(color: .blue);  Text("Cube").font(.caption)
+                        }
                     }
-                    .opacity(showSeg ? 1 : 0.3)
 
                     Spacer()
 
@@ -112,13 +77,12 @@ struct ContentView: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
                         .lineLimit(1)
-                    
                 }
                 .frame(width: geo.size.width * 0.34, height: geo.size.height)
             }
             .padding(16)
         }
-        // Headless AR session (hidden view just runs the session)
+        // Headless AR session
         .overlay(
             ARDepthCaptureView(pipeline: depthPipeline).frame(width: 0, height: 0)
         )
@@ -139,7 +103,6 @@ struct ContentView: View {
 
             // Foreground: emphasize the object currently under the scan line
             if shapeId != 0 {
-                // +12 dB boost over background (adjust to taste)
                 audio.setTargetBands(targetMask40, shape: shapeId, boostDB: 12)
             } else {
                 audio.clearTarget()
@@ -147,8 +110,8 @@ struct ContentView: View {
 
             // Spatial & transient cues
             audio.pan = pan
-            audio.updateDistance(z01)   // drives LPF and reverb send
-            audio.triggerEdge(edge01)   // short click overlay on edges
+            audio.updateDistance(z01)
+            audio.triggerEdge(edge01)
         }
         isRunning = true
     }
@@ -160,7 +123,6 @@ struct ContentView: View {
     }
 }
 
-// Small helper for tidy labeled sliders
 private struct LabeledSlider: View {
     let title: String
     @Binding var value: Double

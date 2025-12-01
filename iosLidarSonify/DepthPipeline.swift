@@ -12,7 +12,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
 
     // Public outputs
     @Published var debugImage: UIImage?
-    @Published var segOverlay: UIImage? = nil
     @Published var fps: Double = 0
     @Published var scanColumn: Int = 0
     @Published var classHistogramText: String = "classGrid histogram: []"
@@ -20,55 +19,49 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     // Mapping
     var nearMeters: Float = 0.30
     var farMeters: Float = 4.00
-    var gainRangeDB: Float = 24 // 0 dB to -gainRangeDB
+    var gainRangeDB: Float = 24
 
     // AR
     private let session = ARSession()
 
-    // Downsampled buffer (60x40)
+    // Downsampled depth buffer (60x40)
     private var grid = [Float](repeating: 0, count: gridWidth * gridHeight)
     private let gridLock = NSLock()
 
-    // Segmentation: downsampled class grid aligned with depth grid
+    // Segmentation
     private let segmentationModel = ObjectSegmentation()
     private var lastSegmentationTime: TimeInterval = 0
-    private let segmentationInterval: TimeInterval = 0.15 // seconds, ~6–7 Hz
+    private let segmentationInterval: TimeInterval = 0.15
     private var isSegmentationRunning: Bool = false
 
-    // Class IDs per 60x40 cell (from segmentation)
+    // Class IDs per 60x40 cell
     private var classGrid = [UInt8](repeating: 0, count: gridWidth * gridHeight)
+    
+    // Track classGrid version for debugging
+    private var classGridVersion: UInt64 = 0
 
     private let rotateSegMask90CW: Bool = true
-    // Mirror the segmentation grid writeout so classGrid aligns with camera view.
-    // This affects BOTH the debug overlay and all downstream logic (sweep, target coverage).
-    private let mirrorSegX: Bool = true   // horizontal mirror
-    private let mirrorSegY: Bool = true   // vertical mirror
+    private let mirrorSegX: Bool = true
+    private let mirrorSegY: Bool = true
 
-    // Leave overlay flips off to avoid double mirroring in the rendered image.
-    private let overlayFlipX: Bool = false
-    private let overlayFlipY: Bool = false
-
-    // Target class for object-aware sonification (placeholder)
     var targetClass: UInt8 = 1
 
     // Sweep
     private var displayLink: CADisplayLink?
-    private var sweepTimer: Timer?
     private var sweepSeconds: Double = 2.0
     private var sweepStart = Date()
 
-    // Callback: column envelope + target mask + shape id + pan + z (0 near…1 far) + edge strength (0…1)
     private var onColumn: ((Int, [Float], [Float], Int, Float, Float, Float) -> Void)?
 
-    // FPS measure
+    // FPS
     private var lastTime = Date()
     private var frameCount = 0
     
-    // ===== PERFORMANCE: Overlay throttling =====
-    private var lastOverlayUpdateTime: TimeInterval = 0
-    private let overlayUpdateInterval: TimeInterval = 0.1  // Max 10 Hz UI updates
+    // Throttling
+    private var lastUIUpdateTime: TimeInterval = 0
+    private let uiUpdateInterval: TimeInterval = 0.1
     private var lastDebugPrintTime: TimeInterval = 0
-    private let debugPrintInterval: TimeInterval = 0.5     // Throttle debug prints
+    private let debugPrintInterval: TimeInterval = 1.0
 
     func attach(to container: UIView) {
         let config = ARWorldTrackingConfiguration()
@@ -83,7 +76,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         self.sweepSeconds = sweepSeconds
         self.sweepStart = Date()
 
-        // Use display link to drive sweep independent of AR frame rate
         displayLink?.invalidate()
         let dl = CADisplayLink(target: self, selector: #selector(step))
         dl.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
@@ -102,50 +94,44 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         let phase = (t.truncatingRemainder(dividingBy: period) + period)
                      .truncatingRemainder(dividingBy: period) / period
 
-        // RIGHT → LEFT across columns
+        // FIX: LEFT → RIGHT scan (column 0 to 59)
         let maxCol = Double(Self.gridWidth - 1)
-        let col = (Self.gridWidth - 1) - Int(round(phase * maxCol))
+        let col = Int(round(phase * maxCol))  // 0 → 59 as phase goes 0 → 1
         scanColumn = col
 
+        // Get depth envelope for current column (real-time)
         let env = columnEnvelope(col: col)
+        
+        // Get object mask for current column from classGrid
         let (targetMask, shapeId) = columnTargetMaskAndShape(col: col)
 
-        // Pan: +1 at right → -1 at left to match visual
-        let norm = Double(col) / maxCol       // 1 → 0 over sweep
-        let pan = Float(norm * 2 - 1)         // +1 → -1
+        // Pan: LEFT=-1, RIGHT=+1 (matches visual: left side of screen = left ear)
+        let norm = Double(col) / maxCol  // 0 → 1 as we scan left → right
+        let pan = Float(norm * 2 - 1)    // -1 → +1
 
-        // Distance & edge strength for this (mirrored) column
+        // Depth-based parameters from real-time data
         var z01 = columnZ01(col: col)
         let edge01 = columnEdge01(col: col)
 
-        // Target coverage in this column (0..1 of vertical cells belonging to targetClass)
+        // Target coverage boost
         let targetCov = columnTargetCoverage(col: col)
-        
-        // THROTTLED debug print
-        let now = CACurrentMediaTime()
-        if now - lastDebugPrintTime > debugPrintInterval {
-            lastDebugPrintTime = now
-            print("scan col \(col), targetCov = \(String(format: "%.2f", targetCov)), shape = \(shapeId)")
-        }
-
-        // Optional debug print to show when a target is active in this column
-        // (also throttled to avoid spam)
-        if shapeId != 0 && now - lastDebugPrintTime > debugPrintInterval {
-            let activeBands = targetMask.enumerated().filter{ $0.element > 0 }.map{ $0.offset }
-            print("target active col \(col): shape \(shapeId), bands: \(activeBands.count)")
-        }
-
-        // Simple target-based boost: when target coverage is high, pull z01 slightly "closer"
-        // so the target feels more foreground in the sonification.
         let boost: Float = targetCov * 0.3
         z01 = clamp01(z01 - boost)
 
+        // Send to audio
         onColumn?(col, env, targetMask, Int(shapeId), pan, z01, edge01)
 
-        // THROTTLED UI update - only update debugImage at ~10Hz max
-        if now - lastOverlayUpdateTime > overlayUpdateInterval {
-            lastOverlayUpdateTime = now
-            if let img = debugImageFromGrid() {
+        // Throttled debug
+        let now = CACurrentMediaTime()
+        if now - lastDebugPrintTime > debugPrintInterval {
+            lastDebugPrintTime = now
+            print("sweep col=\(col), shape=\(shapeId), gridVer=\(classGridVersion)")
+        }
+
+        // Throttled single UI update
+        if now - lastUIUpdateTime > uiUpdateInterval {
+            lastUIUpdateTime = now
+            if let img = debugImageFromGrid(highlightCol: col) {
                 DispatchQueue.main.async {
                     self.debugImage = img
                 }
@@ -161,13 +147,11 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
 
         gridLock.lock(); defer { gridLock.unlock() }
 
-        // Build histogram of all classes in this column
         for y in 0..<H {
             let cls = Int(classGrid[y * W + col])
             if cls >= 0 && cls < hist.count { hist[cls] += 1 }
         }
 
-        // Choose dominant non-background class id
         var shapeId: UInt8 = 0
         var bestCount = 0
         for c in 1..<hist.count {
@@ -176,7 +160,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                 shapeId = UInt8(c)
             }
         }
-
         
         if shapeId != 0 {
             for y in 0..<H {
@@ -189,20 +172,19 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
 
         return (mask, shapeId)
     }
+    
     // MARK: ARSessionDelegate
 
     private func handleFrame(_ frame: ARFrame) {
         guard let depthPB = frame.sceneDepth?.depthMap else { return }
         updateGrid(from: depthPB)
 
-        // Run segmentation at a lower rate than AR frame rate
         let nowTime = frame.timestamp
-        if nowTime - lastSegmentationTime > segmentationInterval {
+        if nowTime - lastSegmentationTime > segmentationInterval && !isSegmentationRunning {
             lastSegmentationTime = nowTime
             runSegmentation(on: frame)
         }
 
-        // FPS estimate from AR callback
         frameCount += 1
         let now = Date()
         let dt = now.timeIntervalSince(lastTime)
@@ -211,40 +193,27 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
             frameCount = 0
             lastTime = now
         }
-
-        // THROTTLED: Update segOverlay at reduced rate (moved from every frame)
-        let currentTime = CACurrentMediaTime()
-        if currentTime - lastOverlayUpdateTime > overlayUpdateInterval {
-            // Note: debugImage is updated in step(), segOverlay updated here
-            if let img = debugImageFromGrid() {
-                DispatchQueue.main.async {
-                    self.segOverlay = img
-                }
-            }
-        }
     }
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         handleFrame(frame)
     }
 
-    /// Public entry for external ARSession delegates to forward frames here.
     func process(frame: ARFrame) {
         handleFrame(frame)
     }
 
-    // MARK: - Segmentation helpers
+    // MARK: - Segmentation
 
     private func runSegmentation(on frame: ARFrame) {
         guard !isSegmentationRunning else { return }
         isSegmentationRunning = true
+        
         segmentationModel?.predictMask(from: frame) { [weak self] mask, width, height in
             guard let self = self else { return }
             defer { self.isSegmentationRunning = false }
 
-            guard let mask = mask,
-                  width > 0, height > 0 else { return }
-
+            guard let mask = mask, width > 0, height > 0 else { return }
             self.updateClassGrid(from: mask, maskWidth: width, maskHeight: height)
         }
     }
@@ -260,8 +229,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                 var counts = [Int](repeating: 0, count: 4)
 
                 if rotateSegMask90CW {
-                    // --- Downsample a 90°-CW-rotated view of the mask (do not rotate the final image) ---
-                    // Rotated view has width H and height W.
                     let rx0 = gx * H / Self.gridWidth
                     let rx1 = min((gx + 1) * H / Self.gridWidth, H)
                     let ry0 = gy * W / Self.gridHeight
@@ -271,7 +238,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                     while ry < ry1 {
                         var rx = rx0
                         while rx < rx1 {
-                            // pure 90° CW rotation (no extra horizontal flip)
                             let xOrig = ry
                             let yOrig = (H - 1 - rx)
                             let idx = yOrig * W + xOrig
@@ -284,7 +250,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                         ry += 1
                     }
                 } else {
-                    // --- No rotation: original orientation ---
                     let x0 = gx * W / Self.gridWidth
                     let x1 = min((gx + 1) * W / Self.gridWidth, W)
                     let y0 = gy * H / Self.gridHeight
@@ -305,7 +270,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                 }
 
                 let (bestClass, _) = counts.enumerated().max(by: { $0.element < $1.element }) ?? (0, 0)
-                // Write into possibly mirrored destination cell so the 60x40 class grid matches the camera view.
                 let dstX = mirrorSegX ? (Self.gridWidth  - 1 - gx) : gx
                 let dstY = mirrorSegY ? (Self.gridHeight - 1 - gy) : gy
                 newGrid[dstY * Self.gridWidth + dstX] = UInt8(bestClass)
@@ -314,23 +278,9 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
 
         gridLock.lock()
         classGrid = newGrid
+        classGridVersion += 1
         gridLock.unlock()
 
-        // DEBUG: class distribution in the 60x40 grid (4 classes)
-        // THROTTLED to avoid excessive logging
-        let now = CACurrentMediaTime()
-        if now - lastDebugPrintTime > debugPrintInterval {
-            var hist = [Int](repeating: 0, count: 4)
-            for v in newGrid {
-                let idx = Int(v)
-                if idx >= 0 && idx < hist.count {
-                    hist[idx] += 1
-                }
-            }
-            print("classGrid histogram (bg, sphere, tetra, cube):", hist)
-        }
-        
-        // Update published text for UI (always, it's just a string)
         var hist = [Int](repeating: 0, count: 4)
         for v in newGrid {
             let idx = Int(v)
@@ -343,7 +293,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         }
     }
 
-    // Downsample depth to 60x40 by average pooling per cell
     private func updateGrid(from pb: CVPixelBuffer) {
         CVPixelBufferLockBaseAddress(pb, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
@@ -380,21 +329,16 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         }
     }
 
-    // Build 40-band envelope (bottom row → lowest freq). Depth → gain mapping.
     func columnEnvelope(col: Int) -> [Float] {
         gridLock.lock(); defer { gridLock.unlock() }
         var env = [Float](repeating: 1, count: Self.gridHeight)
         for r in 0..<Self.gridHeight {
-            // flip vertically so index 0 = bottom
             let gy = (Self.gridHeight - 1 - r)
             let d = grid[gy * Self.gridWidth + col]
-            // Normalize depth: near→1, far→0 (invert because nearer = louder)
             let t = clamp01(1 - (d - nearMeters) / max(0.001, (farMeters - nearMeters)))
-            // Map to linear gain via dB range (0 dB down to -gainRangeDB)
             let gDB = (0.0 as Float) - gainRangeDB * (1 - t)
             env[r] = pow(10.0, gDB / 20.0)
         }
-        // Optional smoothing across bands to reduce combing
         smoothInPlace(&env, a: 0.6)
         return env
     }
@@ -408,7 +352,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         var countTarget = 0
         for y in 0..<H {
             let idx = y * W + col
-            // Count ANY non-background class, not just targetClass
             if classGrid[idx] != 0 {
                 countTarget += 1
             }
@@ -424,7 +367,7 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         let range = max(0.001, (farMeters - nearMeters))
         for y in 0..<H {
             let d = grid[y * W + col]
-            let t = clamp01((d - nearMeters) / range) // 0 near → 1 far
+            let t = clamp01((d - nearMeters) / range)
             acc += t
         }
         return acc / Float(H)
@@ -443,7 +386,7 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         }
         let mean = acc / Float(H)
         let norm = mean / max(0.001, (farMeters - nearMeters))
-        return clamp01(norm * 4) // amplify a bit
+        return clamp01(norm * 4)
     }
 
     private func smoothInPlace(_ x: inout [Float], a: Float) {
@@ -460,12 +403,11 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         }
     }
 
-    private func debugImageFromGrid() -> UIImage? {
-        // Render 60x40: grayscale depth, with non-background segmentation cells tinted blue
+    /// Render single debug image with depth, segmentation overlay, AND scan line
+    private func debugImageFromGrid(highlightCol: Int) -> UIImage? {
         let W = Self.gridWidth
         let H = Self.gridHeight
 
-        // Build RGBA buffer
         var rgba = [UInt8](repeating: 0, count: W * H * 4)
 
         gridLock.lock()
@@ -474,35 +416,40 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
             for x in 0..<W {
                 let idx = y * W + x
                 let d = grid[idx]
-                // Normalize depth: near→1, far→0 (closer=brighter)
                 let t = clamp01(1 - (d - nearMeters) / range)
                 let gray = UInt8(t * 255)
 
                 let cls = classGrid[idx]
                 let base = idx * 4
 
-                if cls == 0 {
-                    // Background: grayscale
-                    rgba[base + 0] = gray       // R
-                    rgba[base + 1] = gray       // G
-                    rgba[base + 2] = gray       // B
-                    rgba[base + 3] = 255        // A
+                // Check if this is the scan line column
+                let isScanLine = (x == highlightCol)
+
+                if isScanLine {
+                    // Draw scan line in red
+                    rgba[base + 0] = 255  // R
+                    rgba[base + 1] = 0    // G
+                    rgba[base + 2] = 0    // B
+                    rgba[base + 3] = 255  // A
+                } else if cls == 0 {
+                    rgba[base + 0] = gray
+                    rgba[base + 1] = gray
+                    rgba[base + 2] = gray
+                    rgba[base + 3] = 255
                 } else {
-                    // Foreground classes with color coding
-                    // sphere=1 → red, tetra=2 → green, cube=3 → blue
                     let overlayAlpha: Float = 0.55
                     let grayF = Float(gray)
                     var r: Float = grayF, g: Float = grayF, b: Float = grayF
                     switch cls {
-                    case 1: // sphere → red
+                    case 1:
                         r = max(grayF, 200)
                         g = grayF * (1.0 - overlayAlpha)
                         b = grayF * (1.0 - overlayAlpha)
-                    case 2: // tetra → green
+                    case 2:
                         r = grayF * (1.0 - overlayAlpha)
                         g = max(grayF, 200)
                         b = grayF * (1.0 - overlayAlpha)
-                    case 3: // cube → blue
+                    case 3:
                         r = grayF * (1.0 - overlayAlpha)
                         g = grayF * (1.0 - overlayAlpha)
                         b = max(grayF, 200)
@@ -517,24 +464,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
             }
         }
         gridLock.unlock()
-
-        // Apply requested flips to the overlay buffer so it aligns with the UI camera view
-        if overlayFlipX || overlayFlipY {
-            var flipped = [UInt8](repeating: 0, count: rgba.count)
-            for y in 0..<H {
-                for x in 0..<W {
-                    let sx = overlayFlipX ? (W - 1 - x) : x
-                    let sy = overlayFlipY ? (H - 1 - y) : y
-                    let sIdx = (sy * W + sx) * 4
-                    let dIdx = (y * W + x) * 4
-                    flipped[dIdx + 0] = rgba[sIdx + 0] // R
-                    flipped[dIdx + 1] = rgba[sIdx + 1] // G
-                    flipped[dIdx + 2] = rgba[sIdx + 2] // B
-                    flipped[dIdx + 3] = rgba[sIdx + 3] // A
-                }
-            }
-            rgba = flipped
-        }
 
         let bytesPerRow = W * 4
         let cfData = CFDataCreate(nil, rgba, rgba.count)!
@@ -553,7 +482,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                             decode: nil,
                             shouldInterpolate: false,
                             intent: .defaultIntent) {
-            // No longer rotate overlay when displayed
             return UIImage(cgImage: cg, scale: UIScreen.main.scale, orientation: .up)
         }
         return nil

@@ -34,62 +34,87 @@ final class SpectralAudioEngine: ObservableObject {
     // Buffers
     private var timeBlock = [Float]()
     private var winTime   = [Float]()
-    private var freqReal  = [Float]()  // N
-    private var freqImag  = [Float]()  // N
-    private var ifftReal  = [Float]()  // N
+    private var freqReal  = [Float]()
+    private var freqImag  = [Float]()
+    private var ifftReal  = [Float]()
     private var zeroImag  = [Float]()
     private var scratchImagTime = [Float]()
     private var targetBoostBands = [Float](repeating: 0, count: 40)
     private var targetBoostLin: Float = powf(10.0, 12.0/20.0)
-    private var targetBoostSmooth: Float = 0.6
+    private let targetBoostSmooth: Float = 0.6
     private var targetShape: Int = 0
     
-    // Pre-allocated foreground buffer to avoid per-block allocation
+    // Pre-allocated foreground buffer
     private var foregroundBuf = [Float]()
     
-    // ===== Comb filters for target-object sonification =====
-    // Lightweight time-domain implementations with DISTINCT timbres
+    // ===== STABLE Comb filters - FIXED M values per shape =====
+    // The M values are now fixed at initialization and don't change based on fc
+    // This eliminates pitch drift and the "glitchy" sound
     
-    /// Feedback comb: creates pitched resonance at f0 = sr/M
-    /// Higher g = longer decay, more tonal. Used for SPHERE (warm, sustained)
     struct FBComb {
         var g: Float
-        var M: Int
-        var buf: [Float]; var i = 0
-        init(g: Float, M: Int) { self.g = g; self.M = max(1, M); self.buf = .init(repeating: 0, count: max(1, M)) }
-        mutating func reinit(g: Float, M: Int) { self.g = g; self.M = max(1, M); self.buf = .init(repeating: 0, count: self.M); self.i = 0 }
+        let M: Int  // Now constant
+        var buf: [Float]
+        var i = 0
+        
+        init(g: Float, M: Int) {
+            self.g = g
+            self.M = max(1, M)
+            self.buf = [Float](repeating: 0, count: self.M)
+        }
+        
         mutating func process(_ x: Float) -> Float {
             let y = x + g * buf[i]
             buf[i] = y
             i = (i + 1) % M
             return y
         }
-        mutating func clear() { buf = [Float](repeating: 0, count: M); i = 0 }
+        
+        mutating func clear() {
+            for j in 0..<buf.count { buf[j] = 0 }
+            i = 0
+        }
     }
     
-    /// Feed-forward comb: creates notches, brighter/harsher. Used for TETRA (metallic)
     struct FFComb {
         var alpha: Float
-        var M: Int
-        var buf: [Float]; var i = 0
-        init(alpha: Float, M: Int) { self.alpha = alpha; self.M = max(1, M); self.buf = .init(repeating: 0, count: max(1, M)) }
-        mutating func reinit(alpha: Float, M: Int) { self.alpha = alpha; self.M = max(1, M); self.buf = .init(repeating: 0, count: self.M); self.i = 0 }
+        let M: Int
+        var buf: [Float]
+        var i = 0
+        
+        init(alpha: Float, M: Int) {
+            self.alpha = alpha
+            self.M = max(1, M)
+            self.buf = [Float](repeating: 0, count: self.M)
+        }
+        
         mutating func process(_ x: Float) -> Float {
             let y = x + alpha * buf[i]
             buf[i] = x
             i = (i + 1) % M
             return y
         }
-        mutating func clear() { buf = [Float](repeating: 0, count: M); i = 0 }
+        
+        mutating func clear() {
+            for j in 0..<buf.count { buf[j] = 0 }
+            i = 0
+        }
     }
     
-    /// Allpass comb: preserves magnitude, shifts phase. Used for CUBE (diffuse, percussive)
     struct APComb {
         var a: Float
-        var M: Int
-        var xbuf: [Float], ybuf: [Float]; var i = 0
-        init(a: Float, M: Int) { self.a = a; self.M = max(1, M); xbuf = .init(repeating: 0, count: max(1, M)); ybuf = xbuf }
-        mutating func reinit(a: Float, M: Int) { self.a = a; self.M = max(1, M); xbuf = .init(repeating: 0, count: self.M); ybuf = xbuf; i = 0 }
+        let M: Int
+        var xbuf: [Float]
+        var ybuf: [Float]
+        var i = 0
+        
+        init(a: Float, M: Int) {
+            self.a = a
+            self.M = max(1, M)
+            self.xbuf = [Float](repeating: 0, count: self.M)
+            self.ybuf = [Float](repeating: 0, count: self.M)
+        }
+        
         mutating func process(_ x: Float) -> Float {
             let xm = xbuf[i], ym = ybuf[i]
             let y = -a * x + xm + a * ym
@@ -98,42 +123,49 @@ final class SpectralAudioEngine: ObservableObject {
             i = (i + 1) % M
             return y
         }
-        mutating func clear() { xbuf = [Float](repeating: 0, count: M); ybuf = xbuf; i = 0 }
+        
+        mutating func clear() {
+            for j in 0..<xbuf.count { xbuf[j] = 0; ybuf[j] = 0 }
+            i = 0
+        }
     }
     
-    // ===== ENHANCED COMB PARAMETERS FOR CLEAR DIFFERENTIATION =====
-    // Sphere: warm, sustained, low-mid emphasis (feedback comb, high g, longer M)
-    private var sphereComb = FBComb(g: 0.94, M: 220)
+    // ===== FIXED M VALUES FOR DISTINCT TIMBRES =====
+    // At 48kHz: M=200 → 240Hz, M=100 → 480Hz, M=50 → 960Hz
+    // These are tuned for distinct, musical timbres
     
-    // Tetra: bright, metallic, harsh edge (feed-forward, shorter M for higher harmonics)
-    private var tetraComb = FFComb(alpha: 0.92, M: 85)
-    // Add second tetra comb for richer metallic texture
-    private var tetraComb2 = FFComb(alpha: 0.80, M: 127)
+    // Sphere: warm, droning, low fundamental (around 200Hz)
+    private var sphereComb = FBComb(g: 0.92, M: 240)  // ~200Hz @ 48kHz
     
-    // Cube: percussive, diffuse, rhythmic (allpass, very short for transients)
-    private var cubeComb = APComb(a: 0.65, M: 48)
+    // Tetra: bright, metallic, inharmonic (two combs at non-integer ratio)
+    private var tetraComb1 = FFComb(alpha: 0.85, M: 89)   // ~540Hz @ 48kHz
+    private var tetraComb2 = FFComb(alpha: 0.75, M: 144)  // ~333Hz @ 48kHz (golden ratio-ish)
     
+    // Cube: percussive, clicky, short decay
+    private var cubeComb = APComb(a: 0.6, M: 37)  // ~1300Hz @ 48kHz
+    
+    // Shape activation states
     private var sphereActive = false
     private var tetraActive  = false
     private var cubeActive   = false
     
+    // Current levels (smoothed)
     private var sphereLevel: Float = 0.0
     private var tetraLevel:  Float = 0.0
     private var cubeLevel:   Float = 0.0
     
-    // Target levels for smooth ramping (avoids clicks)
+    // Target levels for ramping
     private var sphereTargetLevel: Float = 0.0
     private var tetraTargetLevel:  Float = 0.0
     private var cubeTargetLevel:   Float = 0.0
-    private let levelRampAlpha: Float = 0.92  // Smoothing factor
     
-    // Hold current M to avoid per-column reinitialization
-    private var sphereM: Int = 220
-    private var tetraM:  Int = 85
-    private var cubeM:   Int = 48
+    // Smoothing factor for level ramping (higher = slower/smoother)
+    private let levelRampAlpha: Float = 0.95
     
-    // Dry/wet for allpass branch (cube) - more dry = more percussive attack
-    private var cubeMixBeta: Float = 0.50
+    // Shape mask modulation - use the actual 40-band mask to modulate the sound
+    private var currentMask = [Float](repeating: 0, count: 40)
+    private var smoothedMask = [Float](repeating: 0, count: 40)
+    private let maskSmoothAlpha: Float = 0.85
     
     // Overlap-add ring
     private var olaL: [Float]
@@ -143,16 +175,13 @@ final class SpectralAudioEngine: ObservableObject {
     
     // 40-band mapping
     private let numBands = 40
-    private var bandEdges = [Float]()     // Hz (numBands+1)
-    private var binToBand = [Int]()       // 0…N/2 -> band index
+    private var bandEdges = [Float]()
+    private var binToBand = [Int]()
     
     // Distance & LPF
     private var z01: Float = 0
     private var zSlew: Float = 0
     private let zSlewA: Float = 0.15
-    
-    // Pink noise IIR state
-    private var p0: Float = 0, p1: Float = 0, p2: Float = 0
     
     // Edge clicks
     private var clickEnv: Float = 0
@@ -161,52 +190,13 @@ final class SpectralAudioEngine: ObservableObject {
     private var currentGains = [Float](repeating: 1, count: 40)
     private let gainSmooth: Float = 0.85
     
-    // ===== DEBUG aids =====
-    private let DEBUG_AUDIO = true
+    // ===== DEBUG =====
+    private let DEBUG_AUDIO = false  // Reduced logging
+    private var lastShapeReported: Int = -1
+    private var framesSinceLastLog = 0
     
     private func shapeName(_ s: Int) -> String {
-        switch s {
-        case 1: return "sphere"
-        case 2: return "tetra"
-        case 3: return "cube"
-        default: return "none"
-        }
-    }
-    
-    private var lastReportedShape: Int = -999
-    private var lastMaskCount: Int = -1
-    private var lastFcReported: Int = -1
-    private var lastCombState: String = ""
-    
-    private func activeCombSummary() -> String {
-        var parts: [String] = []
-        if sphereActive { parts.append("sphere(M:\(sphereM), lvl:\(String(format: "%.2f", sphereLevel)))") }
-        if tetraActive  { parts.append("tetra(M:\(tetraM), lvl:\(String(format: "%.2f", tetraLevel)))") }
-        if cubeActive   { parts.append("cube(M:\(cubeM), lvl:\(String(format: "%.2f", cubeLevel)))") }
-        if parts.isEmpty { return "none" }
-        return parts.joined(separator: " | ")
-    }
-    
-    private func reportIfChanged(context: String,
-                                 shape: Int,
-                                 maskCount: Int,
-                                 fcHz: Float,
-                                 boostDB: Float) {
-        guard DEBUG_AUDIO else { return }
-        let fcInt = Int(round(fcHz))
-        let comb = activeCombSummary()
-        if shape != lastReportedShape || maskCount != lastMaskCount || fcInt != lastFcReported || comb != lastCombState {
-            print("[Audio]", context,
-                  "shape=\(shapeName(shape))",
-                  "maskBands=\(maskCount)",
-                  "fc≈\(fcInt)Hz",
-                  "boost=\(String(format: "%.1f", boostDB))dB",
-                  "| active:", comb)
-            lastReportedShape = shape
-            lastMaskCount = maskCount
-            lastFcReported = fcInt
-            lastCombState = comb
-        }
+        switch s { case 1: return "sphere"; case 2: return "tetra"; case 3: return "cube"; default: return "none" }
     }
     
     // ===== init =====
@@ -214,6 +204,21 @@ final class SpectralAudioEngine: ObservableObject {
     init() {
         let session = AVAudioSession.sharedInstance()
         self.sampleRate = session.sampleRate
+        
+        // Re-initialize combs with correct sample rate
+        // Sphere: ~180Hz fundamental for warmth
+        let sphereM = max(100, Int(sampleRate / 180))
+        sphereComb = FBComb(g: 0.92, M: sphereM)
+        
+        // Tetra: ~400Hz and ~650Hz for inharmonic metallic sound
+        let tetra1M = max(50, Int(sampleRate / 400))
+        let tetra2M = max(50, Int(sampleRate / 650))
+        tetraComb1 = FFComb(alpha: 0.85, M: tetra1M)
+        tetraComb2 = FFComb(alpha: 0.75, M: tetra2M)
+        
+        // Cube: ~1000Hz for percussive attack
+        let cubeM = max(20, Int(sampleRate / 1000))
+        cubeComb = APComb(a: 0.6, M: cubeM)
         
         // Hann window normalized
         window = [Float](repeating: 0, count: fftSize)
@@ -234,7 +239,7 @@ final class SpectralAudioEngine: ObservableObject {
         olaL = [Float](repeating: 0, count: fftSize * 2)
         olaR = [Float](repeating: 0, count: fftSize * 2)
         
-        // DFTs (complex<->complex)
+        // DFTs
         forwardDFT = vDSP.DFT<Float>(count: fftSize, direction: .forward, transformType: .complexComplex, ofType: Float.self)!
         inverseDFT = vDSP.DFT<Float>(count: fftSize, direction: .inverse, transformType: .complexComplex, ofType: Float.self)!
         
@@ -257,7 +262,7 @@ final class SpectralAudioEngine: ObservableObject {
             return noErr
         }
         
-        // Graph: Source -> Reverb -> MainMixer
+        // Graph
         engine.attach(srcNode)
         engine.attach(reverb)
         engine.connect(srcNode, to: reverb, format: fmt)
@@ -273,7 +278,7 @@ final class SpectralAudioEngine: ObservableObject {
     func start() { try? engine.start() }
     func stop()  { engine.stop() }
     
-    // MARK: Public controls from pipeline/UI
+    // MARK: Public controls
     
     func configureBands(fMin: Double, fMax: Double) {
         let fm = Float(max(20, min(fMin, fMax - 10)))
@@ -284,7 +289,6 @@ final class SpectralAudioEngine: ObservableObject {
             let t: Float = Float(i) / Float(numBands)
             bandEdges[i] = fm * powf(ratio, t)
         }
-        // Bin → band map (0…N/2)
         let nyq = Float(sampleRate / 2)
         let binHz = nyq / Float(fftSize/2)
         binToBand = [Int](repeating: numBands - 1, count: fftSize/2 + 1)
@@ -313,94 +317,73 @@ final class SpectralAudioEngine: ObservableObject {
         }
     }
     
-    /// 0 (near) … 1 (far)
     func updateDistance(_ z: Float) {
         z01 = max(0, min(1, z))
         zSlew = zSlewA * zSlew + (1 - zSlewA) * z01
-        DispatchQueue.main.async { [weak self] in self?.reverb.wetDryMix = 0 }
     }
     
-    /// Provide a per-band 0…1 mask for the target under the scan line and pick a comb timbre.
-    /// - mask: length-40, 1.0 = "inside target bands"; 0.0 = background
-    /// - shape: 1=sphere, 2=tetra, 3=cube, 0=none
-    /// - boostDB: how much louder than background; default +12 dB
+    /// Set target bands and shape. The mask encodes the vertical extent of the shape.
     func setTargetBands(_ mask: [Float], shape: Int, boostDB: Float = 12.0) {
-        var m = mask
-        if m.count < numBands { m += Array(repeating: 0, count: numBands - m.count) }
-        if m.count > numBands { m = Array(m.prefix(numBands)) }
-        for i in 0..<numBands {
-            targetBoostBands[i] = targetBoostSmooth * targetBoostBands[i]
-            + (1 - targetBoostSmooth) * max(0, min(1, m[i]))
+        // Store mask for modulation
+        for i in 0..<min(numBands, mask.count) {
+            currentMask[i] = mask[i]
         }
         
-        // Shape-aware target boost and level - ENHANCED DIFFERENTIATION
-        var localBoostDB = boostDB
-        var lvl: Float = 0.6
-        switch shape {
-        case 1: // sphere (warm, sustained, lower in mix to avoid masking)
-            localBoostDB = boostDB
-            lvl = 0.50
-        case 2: // tetra (bright, metallic - push forward)
-            localBoostDB = boostDB + 8.0
-            lvl = 1.0
-        case 3: // cube (percussive, very forward)
-            localBoostDB = boostDB + 10.0
-            lvl = 1.1
-        default:
-            localBoostDB = 0
-            lvl = 0
+        // Smooth the target boost bands
+        for i in 0..<numBands {
+            let target = i < mask.count ? max(0, min(1, mask[i])) : 0
+            targetBoostBands[i] = targetBoostSmooth * targetBoostBands[i] + (1 - targetBoostSmooth) * target
         }
-        targetBoostLin = powf(10.0, localBoostDB / 20.0)
+        
+        // Calculate coverage (what % of bands are active)
+        let coverage = mask.reduce(0, +) / Float(numBands)
+        
+        // Set target levels based on shape
+        // Coverage modulates the level - larger shapes = louder
+        let baseLvl = 0.5 + coverage * 0.4  // 0.5 to 0.9 based on coverage
+        
+        targetBoostLin = powf(10.0, boostDB / 20.0)
         targetShape = shape
         
-        // Center frequency from spectral centroid of active bands
-        var sumW: Float = 0, sumF: Float = 0
-        for b in 0..<numBands {
-            let w = targetBoostBands[b]
-            if w > 1e-3 {
-                let f0 = bandEdges[b], f1 = bandEdges[min(b+1, numBands)]
-                let fc = sqrtf(f0 * f1)
-                sumF += w * fc
-                sumW += w
-            }
-        }
-        let fc = (sumW > 0) ? (sumF / sumW) : 600.0
-        
-        // DEBUG: how many bands are actually lit after smoothing?
-        let activeBands = targetBoostBands.reduce(0) { $0 + ($1 > 0.5 ? 1 : 0) }
-        reportIfChanged(context: "setTargetBands",
-                        shape: shape,
-                        maskCount: activeBands,
-                        fcHz: fc,
-                        boostDB: localBoostDB)
-        
-        // IMPORTANT: solo the active shape; explicitly disable the others
         switch shape {
-        case 1:
-            setSphere(on: true,  f0: fc, level: lvl)
-            setTetra(on:  false, f0: fc, level: 0)
-            setCube(on:   false, f0: fc, level: 0)
-        case 2:
-            setSphere(on: false, f0: fc, level: 0)
-            setTetra(on:  true,  f0: fc, level: lvl)
-            setCube(on:   false, f0: fc, level: 0)
-        case 3:
-            setSphere(on: false, f0: fc, level: 0)
-            setTetra(on:  false, f0: fc, level: 0)
-            setCube(on:   true,  f0: fc, level: lvl)
+        case 1: // sphere
+            sphereTargetLevel = baseLvl * 0.7
+            tetraTargetLevel = 0
+            cubeTargetLevel = 0
+        case 2: // tetra
+            sphereTargetLevel = 0
+            tetraTargetLevel = baseLvl * 0.85
+            cubeTargetLevel = 0
+        case 3: // cube
+            sphereTargetLevel = 0
+            tetraTargetLevel = 0
+            cubeTargetLevel = baseLvl * 1.0
         default:
-            setSphere(on: false, f0: fc, level: 0)
-            setTetra(on:  false, f0: fc, level: 0)
-            setCube(on:   false, f0: fc, level: 0)
+            sphereTargetLevel = 0
+            tetraTargetLevel = 0
+            cubeTargetLevel = 0
+        }
+        
+        // Activate shapes as needed (but don't clear buffers - just set active flag)
+        if shape == 1 && !sphereActive { sphereActive = true }
+        if shape == 2 && !tetraActive { tetraActive = true }
+        if shape == 3 && !cubeActive { cubeActive = true }
+        
+        // Logging (throttled)
+        if DEBUG_AUDIO && shape != lastShapeReported {
+            lastShapeReported = shape
+            print("[Audio] Shape: \(shapeName(shape)), coverage: \(String(format: "%.2f", coverage))")
         }
     }
     
     func clearTarget() {
-        for i in 0..<numBands { targetBoostBands[i] = 0 }
-        if DEBUG_AUDIO { print("[Audio] clearTarget (all shapes OFF)") }
-        setSphere(on: false, f0: 600, level: 0)
-        setTetra(on:  false, f0: 600, level: 0)
-        setCube(on:   false, f0: 600, level: 0)
+        for i in 0..<numBands {
+            targetBoostBands[i] *= 0.9  // Gradual decay
+            currentMask[i] = 0
+        }
+        sphereTargetLevel = 0
+        tetraTargetLevel = 0
+        cubeTargetLevel = 0
     }
     
     func triggerEdge(_ strength: Float) {
@@ -408,112 +391,27 @@ final class SpectralAudioEngine: ObservableObject {
         clickEnv = max(clickEnv, s * 0.6)
     }
     
-    // MARK: Shape controls - ENHANCED PARAMETERS
-    
-    func setTargetComb(shape: Int, on: Bool, f0: Float, level: Float) {
-        let sr = Float(sampleRate)
-        let lv = max(0, min(1, level)) * 0.7  // Slightly higher base level
-        
-        switch shape {
-        case 1: // sphere → feedback comb (warm, sustained, tonal)
-            if on {
-                sphereTargetLevel = lv
-                if !sphereActive {
-                    sphereActive = true
-                    sphereLevel = 0  // Start at 0, ramp up
-                    // Sphere: longer delays for lower, warmer pitch
-                    let desiredM = max(1, Int(round(sr / max(80, min(4000, f0)))))
-                    sphereM = max(100, min(500, desiredM))  // Lower range = warmer
-                    sphereComb.reinit(g: 0.94, M: sphereM)  // High feedback for sustain
-                    if DEBUG_AUDIO { print("[Audio] sphere ON  M=\(sphereM) g=0.94 target_lvl=\(String(format: "%.2f", lv))") }
-                } else {
-                    sphereComb.g = 0.94
-                }
-            } else {
-                sphereTargetLevel = 0
-                if sphereActive && sphereLevel < 0.001 {
-                    sphereActive = false
-                    sphereComb.clear()
-                    if DEBUG_AUDIO { print("[Audio] sphere OFF") }
-                }
-            }
-            
-        case 2: // tetra → dual feed-forward combs (bright, metallic, harsh)
-            if on {
-                tetraTargetLevel = lv
-                if !tetraActive {
-                    tetraActive = true
-                    tetraLevel = 0
-                    // Tetra: shorter delays for brighter, more metallic sound
-                    let desiredM = max(1, Int(round(sr / max(200, min(8000, f0)))))
-                    tetraM = max(40, min(160, desiredM))  // Shorter = brighter
-                    tetraComb.reinit(alpha: 0.92, M: tetraM)
-                    // Second comb at inharmonic ratio for metallic quality
-                    tetraComb2.reinit(alpha: 0.80, M: max(30, Int(Float(tetraM) * 1.618)))
-                    if DEBUG_AUDIO { print("[Audio] tetra  ON  M=\(tetraM)/\(tetraComb2.M) alpha=0.92/0.80 target_lvl=\(String(format: "%.2f", lv))") }
-                } else {
-                    tetraComb.alpha = 0.92
-                    tetraComb2.alpha = 0.80
-                }
-            } else {
-                tetraTargetLevel = 0
-                if tetraActive && tetraLevel < 0.001 {
-                    tetraActive = false
-                    tetraComb.clear()
-                    tetraComb2.clear()
-                    if DEBUG_AUDIO { print("[Audio] tetra  OFF") }
-                }
-            }
-            
-        case 3: // cube → allpass comb + heavy dry mix (percussive, diffuse, rhythmic)
-            if on {
-                cubeTargetLevel = lv * 1.3  // Extra boost for cube
-                if !cubeActive {
-                    cubeActive = true
-                    cubeLevel = 0
-                    // Cube: very short for percussive transients
-                    let desiredM = max(1, Int(round(sr / max(400, min(12000, f0)))))
-                    cubeM = max(20, min(100, desiredM))  // Very short = percussive
-                    cubeComb.reinit(a: 0.65, M: cubeM)
-                    cubeMixBeta = 0.40  // More dry signal for attack
-                    if DEBUG_AUDIO { print("[Audio] cube   ON  M=\(cubeM) a=0.65 mix=0.40 target_lvl=\(String(format: "%.2f", cubeTargetLevel))") }
-                } else {
-                    cubeComb.a = 0.65
-                    cubeMixBeta = 0.40
-                }
-            } else {
-                cubeTargetLevel = 0
-                if cubeActive && cubeLevel < 0.001 {
-                    cubeActive = false
-                    cubeComb.clear()
-                    if DEBUG_AUDIO { print("[Audio] cube   OFF") }
-                }
-            }
-            
-        default: break
-        }
-    }
-    
-    func setSphere(on: Bool, f0: Float, level: Float) { setTargetComb(shape: 1, on: on, f0: f0, level: level) }
-    func setTetra(on: Bool,  f0: Float, level: Float) { setTargetComb(shape: 2, on: on, f0: f0, level: level) }
-    func setCube(on: Bool,   f0: Float, level: Float) { setTargetComb(shape: 3, on: on, f0: f0, level: level) }
-    
-    // MARK: - DSP - IMPROVED MIXING WITH LEVEL RAMPING
+    // MARK: - DSP
     
     private func processBlock() {
-        // Smooth level transitions to avoid clicks
+        // Smooth level transitions
         sphereLevel = levelRampAlpha * sphereLevel + (1 - levelRampAlpha) * sphereTargetLevel
         tetraLevel  = levelRampAlpha * tetraLevel  + (1 - levelRampAlpha) * tetraTargetLevel
         cubeLevel   = levelRampAlpha * cubeLevel   + (1 - levelRampAlpha) * cubeTargetLevel
         
-        // Deactivate shapes that have ramped down
+        // Smooth mask for modulation
+        for i in 0..<numBands {
+            smoothedMask[i] = maskSmoothAlpha * smoothedMask[i] + (1 - maskSmoothAlpha) * currentMask[i]
+        }
+        
+        // Deactivate and clear shapes that have fully faded out
         if sphereActive && sphereTargetLevel == 0 && sphereLevel < 0.001 {
             sphereActive = false
             sphereComb.clear()
         }
         if tetraActive && tetraTargetLevel == 0 && tetraLevel < 0.001 {
             tetraActive = false
-            tetraComb.clear()
+            tetraComb1.clear()
             tetraComb2.clear()
         }
         if cubeActive && cubeTargetLevel == 0 && cubeLevel < 0.001 {
@@ -521,17 +419,17 @@ final class SpectralAudioEngine: ObservableObject {
             cubeComb.clear()
         }
         
-        // Generate excitation (white noise)
+        // Generate background noise
         genWhite()
         
-        // window → FFT
+        // Window → FFT
         vDSP_vmul(timeBlock, 1, window, 1, &winTime, 1, vDSP_Length(fftSize))
         forwardDFT.transform(inputReal: winTime,
                              inputImaginary: zeroImag,
                              outputReal: &freqReal,
                              outputImaginary: &freqImag)
         
-        // Apply envelope and target emphasis
+        // Apply spectral shaping (depth envelope)
         applySpectralShaping()
         
         // iDFT
@@ -540,61 +438,87 @@ final class SpectralAudioEngine: ObservableObject {
                              outputReal: &ifftReal,
                              outputImaginary: &scratchImagTime)
         
-        // Normalize block energy (FFT scale + OLA compensation)
+        // Normalize
         var scale = 1.0 / Float(fftSize)
         vDSP_vsmul(ifftReal, 1, &scale, &ifftReal, 1, vDSP_Length(fftSize))
         var gain = invWindowEnergy * 4
         vDSP_vsmul(ifftReal, 1, &gain, &ifftReal, 1, vDSP_Length(fftSize))
         
-        // === Generate foreground shape signal separately ===
+        // === Generate foreground shape signal ===
         let hasActiveSignal = (sphereActive && sphereLevel > 0.005) ||
                               (tetraActive && tetraLevel > 0.005) ||
                               (cubeActive && cubeLevel > 0.005)
+        
+        // Calculate mask-based modulation
+        // Higher bands = higher frequency modulation
+        var maskMod: Float = 0.5
+        var maskWeightSum: Float = 0
+        for i in 0..<numBands {
+            let w = smoothedMask[i]
+            maskMod += w * Float(i) / Float(numBands)
+            maskWeightSum += w
+        }
+        if maskWeightSum > 0.01 {
+            maskMod /= maskWeightSum
+        }
+        // maskMod now ranges 0-1, with higher = shape is higher in the frame
         
         // Clear foreground buffer
         for i in 0..<fftSize { foregroundBuf[i] = 0 }
         
         if hasActiveSignal {
+            // Use mask modulation to affect timbre slightly
+            // Higher shapes get brighter excitation
+            let excBrightness = 0.3 + maskMod * 0.7  // 0.3 to 1.0
+            
             for i in 0..<fftSize {
-                // Independent noise source for foreground (decorrelated from background)
-                let exc = Float.random(in: -1...1) * 0.6
+                // Shaped noise excitation - higher maskMod = brighter
+                var exc = Float.random(in: -1...1) * 0.5
+                if excBrightness > 0.5 {
+                    // Add some high frequency content for higher shapes
+                    exc += Float.random(in: -0.3...0.3)
+                }
+                
                 var add: Float = 0
                 
-                // SPHERE: feedback comb for warm, sustained, tonal sound
+                // SPHERE: warm, droning, sustained
                 if sphereActive && sphereLevel > 0.005 {
-                    let sphereOut = sphereComb.process(exc)
-                    add += sphereLevel * sphereOut
+                    // Modulate feedback based on mask (larger = more sustain)
+                    sphereComb.g = 0.88 + maskWeightSum * 0.06  // 0.88 to 0.94
+                    let out = sphereComb.process(exc)
+                    add += sphereLevel * out * 0.8
                 }
                 
-                // TETRA: dual feed-forward combs for bright, metallic, inharmonic sound
+                // TETRA: metallic, inharmonic, bright
                 if tetraActive && tetraLevel > 0.005 {
-                    let t1 = tetraComb.process(exc)
-                    let t2 = tetraComb2.process(exc)
-                    // Mix two combs for richer metallic texture
-                    let tetraOut = t1 * 0.6 + t2 * 0.4
-                    add += tetraLevel * tetraOut
+                    let t1 = tetraComb1.process(exc)
+                    let t2 = tetraComb2.process(exc * 0.8)
+                    let out = t1 * 0.55 + t2 * 0.45
+                    add += tetraLevel * out * 0.9
                 }
                 
-                // CUBE: allpass + dry for percussive, diffuse, rhythmic sound
+                // CUBE: percussive, clicky, short
                 if cubeActive && cubeLevel > 0.005 {
                     let wet = cubeComb.process(exc)
-                    let cubeOut = (1 - cubeMixBeta) * exc + cubeMixBeta * wet
-                    add += cubeLevel * cubeOut
+                    // More dry = more attack
+                    let dryMix: Float = 0.5 - maskMod * 0.2  // Less dry for higher shapes
+                    let out = dryMix * exc + (1 - dryMix) * wet
+                    add += cubeLevel * out * 1.0
                 }
                 
                 foregroundBuf[i] = add
             }
         }
         
-        // Mix background + foreground with automatic ducking
+        // Mix background + foreground with ducking
         var fgSumSq: Float = 0
         vDSP_svesq(foregroundBuf, 1, &fgSumSq, vDSP_Length(fftSize))
         let fgRMS = sqrtf(fgSumSq / Float(fftSize))
         let hasForeground = fgRMS > 1e-4
         
-        // Duck background more aggressively when shape present
-        let bgDuck: Float = hasForeground ? 0.30 : 1.0
-        let fgGain: Float = 0.85  // Foreground level
+        // Duck background when shape present
+        let bgDuck: Float = hasForeground ? 0.35 : 1.0
+        let fgGain: Float = 0.8
         
         for i in 0..<fftSize {
             ifftReal[i] = ifftReal[i] * bgDuck + foregroundBuf[i] * fgGain
@@ -668,7 +592,7 @@ final class SpectralAudioEngine: ObservableObject {
         }
     }
     
-    // MARK: - FIXED applySpectralShaping
+    // MARK: Spectral shaping
     
     private func applySpectralShaping() {
         guard bandEdges.count == numBands + 1, !binToBand.isEmpty else { return }
@@ -690,18 +614,15 @@ final class SpectralAudioEngine: ObservableObject {
             
             let gAtt = min(1.0, max(0.05, gBand))
             
-            // Target boost for bins in emphasized bands
+            // Target boost
             let tBoost = targetBoostBands[band]
             let boostFactor = 1.0 + (targetBoostLin - 1.0) * tBoost
             
-            // Combined weight: base gain × triangular filter × boost
             let w = gAtt * tri * boostFactor
             
-            // Apply to frequency domain (both real and imag)
             freqReal[i] *= w
             freqImag[i] *= w
             
-            // Mirror for negative frequencies (except DC and Nyquist)
             if i > 0 && i < half {
                 let mirrorIdx = fftSize - i
                 freqReal[mirrorIdx] *= w
