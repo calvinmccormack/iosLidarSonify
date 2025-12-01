@@ -10,7 +10,6 @@ struct ContentView: View {
     @State private var fMin: Double = 50
     @State private var fMax: Double = 10050
     @State private var gainRangeDB: Double = 24
-    @State private var mode: SpectralAudioEngine.SourceMode = .square
     @State private var showSeg: Bool = true
     @State private var segAlpha: Double = 0.55
     
@@ -72,15 +71,6 @@ struct ContentView: View {
                         Spacer()
                     }
 
-                    Picker("Source", selection: $mode) {
-                        ForEach(SpectralAudioEngine.SourceMode.allCases) { m in
-                            Text(m.label).tag(m)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .onChange(of: mode) { _, newMode in
-                        audio.sourceMode = newMode
-                    }
 
                     Group {
                         LabeledSlider(title: "Sweep (s)", value: $sweepSeconds, range: 0.5...8.0, format: "%.1f")
@@ -134,7 +124,6 @@ struct ContentView: View {
         )
         .onAppear {
             audio.configureBands(fMin: fMin, fMax: fMax)
-            audio.sourceMode = mode
         }
         .onChange(of: fMin) { _, v in audio.configureBands(fMin: v, fMax: fMax) }
         .onChange(of: fMax) { _, v in audio.configureBands(fMin: fMin, fMax: v) }
@@ -144,8 +133,19 @@ struct ContentView: View {
     private func start() {
         guard ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) else { return }
         audio.start()
-        depthPipeline.start(sweepSeconds: sweepSeconds) { _, envelope, pan, z01, edge01 in
+        depthPipeline.start(sweepSeconds: sweepSeconds) { col, envelope, targetMask40, shapeId, pan, z01, edge01 in
+            // Background scene envelope (40 bands)
             audio.updateEnvelope(envelope)
+
+            // Foreground: emphasize the object currently under the scan line
+            if shapeId != 0 {
+                // +12 dB boost over background (adjust to taste)
+                audio.setTargetBands(targetMask40, shape: shapeId, boostDB: 12)
+            } else {
+                audio.clearTarget()
+            }
+
+            // Spatial & transient cues
             audio.pan = pan
             audio.updateDistance(z01)   // drives LPF and reverb send
             audio.triggerEdge(edge01)   // short click overlay on edges

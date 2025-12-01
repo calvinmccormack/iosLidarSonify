@@ -57,8 +57,8 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     private var sweepSeconds: Double = 2.0
     private var sweepStart = Date()
 
-    // Callback: column envelope + pan + z (0 near…1 far) + edge strength (0…1)
-    private var onColumn: ((Int, [Float], Float, Float, Float) -> Void)?
+    // Callback: column envelope + target mask + shape id + pan + z (0 near…1 far) + edge strength (0…1)
+    private var onColumn: ((Int, [Float], [Float], Int, Float, Float, Float) -> Void)?
 
     // FPS measure
     private var lastTime = Date()
@@ -72,7 +72,7 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         session.run(config)
     }
 
-    func start(sweepSeconds: Double, onColumn: @escaping (Int, [Float], Float, Float, Float) -> Void) {
+    func start(sweepSeconds: Double, onColumn: @escaping (Int, [Float], [Float], Int, Float, Float, Float) -> Void) {
         self.onColumn = onColumn
         self.sweepSeconds = sweepSeconds
         self.sweepStart = Date()
@@ -102,6 +102,7 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         scanColumn = col
 
         let env = columnEnvelope(col: col)
+        let (targetMask, shapeId) = columnTargetMaskAndShape(col: col)
 
         // Pan: +1 at right → -1 at left to match visual
         let norm = Double(col) / maxCol       // 1 → 0 over sweep
@@ -115,14 +116,54 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         let targetCov = columnTargetCoverage(col: col)
         print("scan col \(col), targetCov = \(targetCov)")
 
+        // Optional debug print to show when a target is active in this column
+        if shapeId != 0 {
+            print("target active col \(col): shape \(shapeId), bands set: \(targetMask.enumerated().filter{ $0.element > 0 }.map{ $0.offset })")
+        }
+
         // Simple target-based boost: when target coverage is high, pull z01 slightly "closer"
         // so the target feels more foreground in the sonification.
         let boost: Float = targetCov * 0.3
         z01 = clamp01(z01 - boost)
 
-        onColumn?(col, env, pan, z01, edge01)
+        onColumn?(col, env, targetMask, Int(shapeId), pan, z01, edge01)
 
         if let img = debugImageFromGrid() { debugImage = img }
+    }
+    /// Build a per-band (40) mask for targetClass coverage in this column,
+    /// and return the dominant non-background class id seen in the column (0 if none).
+    private func columnTargetMaskAndShape(col: Int, bands: Int = DepthPipeline.gridHeight) -> ([Float], UInt8) {
+        let W = Self.gridWidth
+        let H = Self.gridHeight
+        var mask = [Float](repeating: 0, count: bands)
+        var hist = [Int](repeating: 0, count: 4)
+
+        gridLock.lock(); defer { gridLock.unlock() }
+
+        for y in 0..<H {
+            let cls = Int(classGrid[y * W + col])
+            if cls >= 0 && cls < hist.count { hist[cls] += 1 }
+            if classGrid[y * W + col] == targetClass {
+                // map image row y to band index rBand where 0 = bottom
+                let rBand = (H - 1 - y)
+                if rBand >= 0 && rBand < bands { mask[rBand] = 1.0 }
+            }
+        }
+
+        // Choose dominant non-background class id
+        var shapeId: UInt8 = 0
+        var bestCount = 0
+        for c in 1..<hist.count {
+            if hist[c] > bestCount {
+                bestCount = hist[c]
+                shapeId = UInt8(c)
+            }
+        }
+
+        // If there is effectively no target coverage, zero the mask so audio can clear target
+        if !mask.contains(where: { $0 > 0 }) { shapeId = 0 }
+
+        return (mask, shapeId)
     }
 
 

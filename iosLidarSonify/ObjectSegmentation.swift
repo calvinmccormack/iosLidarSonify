@@ -21,8 +21,8 @@ struct SegTuning {
     var erodeIters: Int = 1
 
     /// Per-class morphology overrides
-    var dilateItersSphere: Int = 5
-    var dilateItersTetra:  Int = 5
+    var dilateItersSphere: Int = 3
+    var dilateItersTetra:  Int = 3
     var dilateItersCube:   Int = 1
 
     var erodeItersSphere: Int = 2

@@ -5,43 +5,25 @@ import Combine
 
 final class SpectralAudioEngine: ObservableObject {
 
-    enum SourceMode: String, CaseIterable, Identifiable {
-        case square, pinkNoise, gammatoneNoise
-        var id: String { rawValue }
-        var label: String {
-            switch self {
-            case .square: return "Square"
-            case .pinkNoise: return "Pink noise"
-            case .gammatoneNoise: return "Gammatone noise"
-            }
-        }
-    }
-
-    // UI controls
-    @Published var pan: Float = 0                 // -1…+1
-    @Published var sourceMode: SourceMode = .square
+    // UI
+    @Published var pan: Float = 0
     @Published var enableEdgeClicks: Bool = false
-    // Master output gain (dB)
     @Published var outputGainDB: Float = 6.0
 
     // Constants
     private let sampleRate: Double
     private let fftSize: Int = 1024
-    private let hop: Int = 256 // 4× overlap
+    private let hop: Int = 256
 
-    // AGC (post-shaping, pre-pan)
+    // AGC
     private var agcGain: Float = 1.0
-    private let agcAlpha: Float = 0.95     // smoothing (0.95 = slow)
-    private let agcTargetRMS: Float = 0.20 // ~ -14 dBFS (slightly louder baseline)
+    private let agcAlpha: Float = 0.95
+    private let agcTargetRMS: Float = 0.20
 
     // Engine
     private let engine = AVAudioEngine()
     private var srcNode: AVAudioSourceNode!
     private let reverb = AVAudioUnitReverb()
-
-    // Square osc
-    private var phase: Float = 0
-    private var freq: Float = 220
 
     // Window / DFT
     private var window: [Float]
@@ -52,13 +34,86 @@ final class SpectralAudioEngine: ObservableObject {
     // Buffers
     private var timeBlock = [Float]()
     private var winTime   = [Float]()
-    private var freqReal  = [Float]()  // N
-    private var freqImag  = [Float]()  // N
-    private var ifftReal  = [Float]()  // N
+    private var freqReal  = [Float]()
+    private var freqImag  = [Float]()
+    private var ifftReal  = [Float]()
     private var zeroImag  = [Float]()
     private var scratchImagTime = [Float]()
 
-    // Overlap-add ring
+    // Target spectral boost from scan
+    private var targetBoostBands = [Float](repeating: 0, count: 40)
+    private var targetBoostLin: Float = powf(10.0, 12.0/20.0)
+    private var targetBoostSmooth: Float = 0.6
+
+    // ===== Simple comb filters (time domain) =====
+    struct FFComb {
+        var alpha: Float
+        var M: Int
+        var buf: [Float]; var i = 0
+        init(alpha: Float, M: Int) { self.alpha = alpha; self.M = max(1, M); self.buf = .init(repeating: 0, count: max(1, M)) }
+        mutating func reinit(alpha: Float, M: Int) { self.alpha = alpha; self.M = max(1, M); self.buf = .init(repeating: 0, count: self.M); self.i = 0 }
+        mutating func process(_ x: Float) -> Float {
+            let y = x + alpha * buf[i]
+            buf[i] = x
+            i = (i + 1) % M
+            return y
+        }
+    }
+    struct FBComb {
+        var g: Float
+        var M: Int
+        var buf: [Float]; var i = 0
+        init(g: Float, M: Int) { self.g = g; self.M = max(1, M); self.buf = .init(repeating: 0, count: max(1, M)) }
+        mutating func reinit(g: Float, M: Int) { self.g = g; self.M = max(1, M); self.buf = .init(repeating: 0, count: self.M); self.i = 0 }
+        mutating func process(_ x: Float) -> Float {
+            let y = x + g * buf[i]
+            buf[i] = y
+            i = (i + 1) % M
+            return y
+        }
+    }
+    struct APComb {
+        var a: Float
+        var M: Int
+        var xbuf: [Float], ybuf: [Float]; var i = 0
+        init(a: Float, M: Int) { self.a = a; self.M = max(1, M); xbuf = .init(repeating: 0, count: max(1, M)); ybuf = xbuf }
+        mutating func reinit(a: Float, M: Int) { self.a = a; self.M = max(1, M); xbuf = .init(repeating: 0, count: self.M); ybuf = xbuf; i = 0 }
+        mutating func process(_ x: Float) -> Float {
+            // M is always >= 1; i is always < M
+            let xm = xbuf[i], ym = ybuf[i]
+            let y = -a * x + xm + a * ym
+            xbuf[i] = x
+            ybuf[i] = y
+            i = (i + 1) % M
+            return y
+        }
+    }
+
+    // Live instances
+    private var sphereComb = FBComb(g: 0.80, M: 200)
+    private var tetraComb  = FFComb(alpha: 1.0, M: 120)
+    private var cubeComb   = APComb(a: 0.85, M: 96)
+    private var cubeComb2  = APComb(a: 0.60, M: 48) // extra stage to make cube audible
+
+    private var sphereActive = false
+    private var tetraActive  = false
+    private var cubeActive   = false
+
+    private var sphereLevel: Float = 0.0
+    private var tetraLevel:  Float = 0.0
+    private var cubeLevel:   Float = 0.0
+    private var cubeMixBeta: Float = 0.60  // stronger dry+AP mix for audibility
+
+    // Pending params for lock-free swap at block boundary
+    private struct PendingFB { var need=false; var g:Float=0.8;  var M:Int=64; var level:Float=0; var active=false }
+    private struct PendingFF { var need=false; var a:Float=1.0;  var M:Int=64; var level:Float=0; var active=false }
+    private struct PendingAP { var need=false; var a:Float=0.85; var M:Int=64; var level:Float=0; var active=false }
+    private var pendSphere = PendingFB()
+    private var pendTetra  = PendingFF()
+    private var pendCube1  = PendingAP()
+    private var pendCube2  = PendingAP()
+
+    // OLA ring
     private var olaL: [Float]
     private var olaR: [Float]
     private var olaWrite = 0
@@ -66,22 +121,21 @@ final class SpectralAudioEngine: ObservableObject {
 
     // 40-band mapping
     private let numBands = 40
-    private var bandEdges = [Float]()     // Hz (numBands+1)
-    private var binToBand = [Int]()       // 0…N/2 -> band index
+    private var bandEdges = [Float]()
+    private var binToBand = [Int]()
 
-    // Distance & LPF
-    // z01: 0 = near, 1 = far
+    // Distance (kept but not coloring timbre now)
     private var z01: Float = 0
-    private var zSlew: Float = 0          // smoothed z for LPF/Reverb
+    private var zSlew: Float = 0
     private let zSlewA: Float = 0.15
 
-    // Pink noise IIR state (Paul Kellet style approx)
+    // Pink state (unused for now)
     private var p0: Float = 0, p1: Float = 0, p2: Float = 0
 
-    // Edge clicks
-    private var clickEnv: Float = 0        // injected short click per block
+    // Edge click
+    private var clickEnv: Float = 0
 
-    // Gain smoothing
+    // Band gain smoothing
     private var currentGains = [Float](repeating: 1, count: 40)
     private let gainSmooth: Float = 0.85
 
@@ -89,14 +143,12 @@ final class SpectralAudioEngine: ObservableObject {
         let session = AVAudioSession.sharedInstance()
         self.sampleRate = session.sampleRate
 
-        // Hann window normalized
         window = [Float](repeating: 0, count: fftSize)
         vDSP_hann_window(&window, vDSP_Length(fftSize), Int32(vDSP_HANN_NORM))
         var sum: Float = 0
         vDSP_sve(window, 1, &sum, vDSP_Length(fftSize))
         invWindowEnergy = sum > 0 ? 1.0 / sum : 1.0
 
-        // Buffers
         timeBlock = [Float](repeating: 0, count: fftSize)
         winTime   = [Float](repeating: 0, count: fftSize)
         freqReal  = [Float](repeating: 0, count: fftSize)
@@ -107,11 +159,9 @@ final class SpectralAudioEngine: ObservableObject {
         olaL = [Float](repeating: 0, count: fftSize * 2)
         olaR = [Float](repeating: 0, count: fftSize * 2)
 
-        // DFTs (complex<->complex)
         forwardDFT = vDSP.DFT<Float>(count: fftSize, direction: .forward, transformType: .complexComplex, ofType: Float.self)!
         inverseDFT = vDSP.DFT<Float>(count: fftSize, direction: .inverse, transformType: .complexComplex, ofType: Float.self)!
 
-        // Source node
         let fmt = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
         srcNode = AVAudioSourceNode { [weak self] _, _, frameCount, ablPtr -> OSStatus in
             guard let self = self else { return noErr }
@@ -122,7 +172,7 @@ final class SpectralAudioEngine: ObservableObject {
 
             var produced = 0
             while produced < n {
-                self.processBlock()
+                self.processBlock() // renders hop samples
                 let toCopy = min(self.hop, n - produced)
                 self.copyFromOLA(to: outL + produced, outR: outR + produced, count: toCopy)
                 produced += toCopy
@@ -130,13 +180,12 @@ final class SpectralAudioEngine: ObservableObject {
             return noErr
         }
 
-        // Graph: Source -> Reverb -> MainMixer
         engine.attach(srcNode)
         engine.attach(reverb)
         engine.connect(srcNode, to: reverb, format: fmt)
         engine.connect(reverb, to: engine.mainMixerNode, format: fmt)
         reverb.loadFactoryPreset(.largeRoom)
-        reverb.wetDryMix = 0 // start dry
+        reverb.wetDryMix = 0
         engine.mainMixerNode.outputVolume = 1.0
 
         try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
@@ -146,7 +195,7 @@ final class SpectralAudioEngine: ObservableObject {
     func start() { try? engine.start() }
     func stop()  { engine.stop() }
 
-    // MARK: Public controls from pipeline/UI
+    // MARK: Controls from pipeline/UI
 
     func configureBands(fMin: Double, fMax: Double) {
         let fm = Float(max(20, min(fMin, fMax - 10)))
@@ -157,7 +206,6 @@ final class SpectralAudioEngine: ObservableObject {
             let t: Float = Float(i) / Float(numBands)
             bandEdges[i] = fm * powf(ratio, t)
         }
-        // Bin → band map (0…N/2)
         let nyq = Float(sampleRate / 2)
         let binHz = nyq / Float(fftSize/2)
         binToBand = [Int](repeating: numBands - 1, count: fftSize/2 + 1)
@@ -166,16 +214,16 @@ final class SpectralAudioEngine: ObservableObject {
             let f1 = bandEdges[b+1]
             let i0 = max(0, Int(floorf(f0 / binHz)))
             let i1 = min(fftSize/2, Int(ceilf(f1 / binHz)))
-            for i in i0...i1 { binToBand[i] = b }
+            if i0 <= i1 {
+                for i in i0...i1 { binToBand[i] = b }
+            }
         }
     }
 
     func updateEnvelope(_ gains40: [Float]) {
-        // 1) Clamp to attenuation‑only (0.05…1.0)
         var g = gains40
         if g.count < numBands { g += Array(repeating: 1, count: numBands - g.count) }
         for i in 0..<numBands { g[i] = min(1.0, max(0.05, g[i])) }
-        // 2) Light spectral smoothing across neighbors (0.2, 0.6, 0.2)
         var s = [Float](repeating: 1, count: numBands)
         for i in 0..<numBands {
             let a = (i > 0) ? g[i-1] : g[i]
@@ -183,55 +231,133 @@ final class SpectralAudioEngine: ObservableObject {
             let c = (i+1 < numBands) ? g[i+1] : g[i]
             s[i] = 0.2*a + 0.6*b + 0.2*c
         }
-        // 3) Temporal smoothing
         for i in 0..<numBands {
             currentGains[i] = gainSmooth * currentGains[i] + (1 - gainSmooth) * s[i]
         }
     }
 
-    /// 0 (near) … 1 (far) — also drives LPF & reverb
     func updateDistance(_ z: Float) {
         z01 = max(0, min(1, z))
-        // Smooth for stability; keep for future use but do not color the timbre now
         zSlew = zSlewA * zSlew + (1 - zSlewA) * z01
-        // Disable distance-based reverb while evaluating pure filter-bank sonification
         DispatchQueue.main.async { [weak self] in self?.reverb.wetDryMix = 0 }
     }
 
-    /// Edge strength 0…1 → inject short click
+    /// Called from the pipeline each scan step.
+    /// `mask`: 40-length 0…1; `shape`: 1 sphere, 2 tetra, 3 cube.
+    func setTargetBands(_ mask: [Float], shape: Int, boostDB: Float = 12.0) {
+        var m = mask
+        if m.count < numBands { m += Array(repeating: 0, count: numBands - m.count) }
+        if m.count > numBands { m = Array(m.prefix(numBands)) }
+        for i in 0..<numBands {
+            targetBoostBands[i] = targetBoostSmooth * targetBoostBands[i]
+                                 + (1 - targetBoostSmooth) * max(0, min(1, m[i]))
+        }
+
+        var localBoostDB = boostDB
+        var lvl: Float = 0.6
+        switch shape {
+        case 1: localBoostDB = max(6.0, boostDB - 3.0); lvl = 0.40  // sphere softer
+        case 2: localBoostDB = boostDB + 6.0;           lvl = 0.95  // tetra forward
+        case 3: localBoostDB = boostDB + 8.0;           lvl = 1.10  // cube most forward
+        default: localBoostDB = 0; lvl = 0
+        }
+        targetBoostLin = powf(10.0, localBoostDB / 20.0)
+
+        // Spectral centroid of active bands → f0
+        var sumW: Float = 0, sumF: Float = 0
+        for b in 0..<numBands {
+            let w = targetBoostBands[b]
+            if w > 1e-3 {
+                let f0 = bandEdges[b], f1 = bandEdges[min(b+1, numBands)]
+                let fc = sqrtf(max(10, f0) * max(10, f1))
+                sumF += w * fc
+                sumW += w
+            }
+        }
+        let fc = (sumW > 0) ? (sumF / sumW) : 600.0
+        setTargetComb(shape: shape, on: shape != 0, f0: fc, level: lvl)
+    }
+
+    func clearTarget() {
+        for i in 0..<numBands { targetBoostBands[i] = 0 }
+        setTargetComb(shape: 1, on: false, f0: 600, level: 0)
+        setTargetComb(shape: 2, on: false, f0: 600, level: 0)
+        setTargetComb(shape: 3, on: false, f0: 600, level: 0)
+    }
+
     func triggerEdge(_ strength: Float) {
-        let s = max(0, min(1, strength))
-        // accumulate a bit so rapid edges pop
-        clickEnv = max(clickEnv, s * 0.6)
+        clickEnv = max(clickEnv, max(0, min(1, strength)) * 0.6)
+    }
+
+    /// UI thread safe: only sets pending params. Actual reinit occurs on audio thread.
+    func setTargetComb(shape: Int, on: Bool, f0: Float, level: Float) {
+        let sr = Float(sampleRate)
+        let fc = max(40, min(8000, f0))
+        let M  = max(1, Int(round(sr / fc)))
+
+        switch shape {
+        case 1: // feedback comb for sphere
+            pendSphere.g = 0.82
+            pendSphere.M = M
+            pendSphere.level = max(0, min(1, level))
+            pendSphere.active = on
+            pendSphere.need = true
+        case 2: // feed-forward comb for tetra
+            pendTetra.a = 1.0 // alpha
+            pendTetra.M = M
+            pendTetra.level = max(0, min(1, level))
+            pendTetra.active = on
+            pendTetra.need = true
+        case 3: // dual all-pass for cube
+            pendCube1.a = 0.85; pendCube1.M = M
+            pendCube2.a = 0.60; pendCube2.M = max(1, M/2)
+            pendCube1.level = max(0, min(1, level))
+            pendCube1.active = on
+            pendCube1.need = true
+            pendCube2.need = true
+        default: break
+        }
     }
 
     // MARK: - DSP
 
-    private func processBlock() {
-        // Generate excitation
-        switch sourceMode {
-        case .square:
-            genSquare()
-            // window → FFT
-            vDSP_vmul(timeBlock, 1, window, 1, &winTime, 1, vDSP_Length(fftSize))
-            forwardDFT.transform(inputReal: winTime,
-                                 inputImaginary: zeroImag,
-                                 outputReal: &freqReal,
-                                 outputImaginary: &freqImag)
-
-        case .pinkNoise:
-            genPink()
-            vDSP_vmul(timeBlock, 1, window, 1, &winTime, 1, vDSP_Length(fftSize))
-            forwardDFT.transform(inputReal: winTime,
-                                 inputImaginary: zeroImag,
-                                 outputReal: &freqReal,
-                                 outputImaginary: &freqImag)
-
-        case .gammatoneNoise:
-            genHermitianNoiseSpectrum() // fills freqReal/freqImag (N) as Hermitian
+    private func applyPendingCombUpdates() {
+        if pendSphere.need {
+            sphereActive = pendSphere.active
+            sphereLevel  = pendSphere.level
+            sphereComb.reinit(g: pendSphere.g, M: pendSphere.M)
+            pendSphere.need = false
         }
+        if pendTetra.need {
+            tetraActive = pendTetra.active
+            tetraLevel  = pendTetra.level
+            tetraComb.reinit(alpha: pendTetra.a, M: pendTetra.M)
+            pendTetra.need = false
+        }
+        if pendCube1.need || pendCube2.need {
+            cubeActive = pendCube1.active
+            cubeLevel  = pendCube1.level
+            cubeComb.reinit(a: pendCube1.a, M: pendCube1.M)
+            cubeComb2.reinit(a: pendCube2.a, M: pendCube2.M)
+            pendCube1.need = false
+            pendCube2.need = false
+        }
+    }
 
-        // Apply 40-band envelope, LPF (2–12 kHz with Z), and mirror
+    private func processBlock() {
+        // Commit any pending comb changes on the audio thread
+        applyPendingCombUpdates()
+
+        // Excitation
+        genWhite()
+
+        // window → FFT
+        vDSP_vmul(timeBlock, 1, window, 1, &winTime, 1, vDSP_Length(fftSize))
+        forwardDFT.transform(inputReal: winTime,
+                             inputImaginary: zeroImag,
+                             outputReal: &freqReal,
+                             outputImaginary: &freqImag)
+
         applySpectralShaping()
 
         // iDFT
@@ -240,42 +366,54 @@ final class SpectralAudioEngine: ObservableObject {
                              outputReal: &ifftReal,
                              outputImaginary: &scratchImagTime)
 
-        // Normalize block energy (FFT scale + OLA compensation)
+        // Normalize block energy
         var scale = 1.0 / Float(fftSize)
         vDSP_vsmul(ifftReal, 1, &scale, &ifftReal, 1, vDSP_Length(fftSize))
         var gain = invWindowEnergy * 4
         vDSP_vsmul(ifftReal, 1, &gain, &ifftReal, 1, vDSP_Length(fftSize))
 
-        // Optional edge click overlay (short decay at start of block)
+        // Add shape signatures
+        if sphereActive || tetraActive || cubeActive {
+            for i in 0..<fftSize {
+                let exc = Float.random(in: -1...1)
+                var add: Float = 0
+                if sphereActive { add += sphereLevel * sphereComb.process(exc) }
+                if tetraActive  { add += tetraLevel  * tetraComb.process(exc) }
+                if cubeActive {
+                    // dual AP + dry for strong phasing
+                    let y1 = cubeComb.process(exc)
+                    let y2 = cubeComb2.process(y1)
+                    add += cubeLevel * ((1 - cubeMixBeta) * exc + cubeMixBeta * y2)
+                }
+                ifftReal[i] += add
+            }
+        }
+
+        // Edge click
         if enableEdgeClicks, clickEnv > 1e-4 {
             let len = min(24, fftSize)
             for i in 0..<len {
-                // softer, shorter click
                 let env = (clickEnv * 0.2) * expf(-Float(i) / 6.0)
                 ifftReal[i] += env
             }
-            clickEnv *= 0.2 // faster decay per block
+            clickEnv *= 0.2
         } else {
-            // decay even if disabled so queued clicks drain
             clickEnv *= 0.1
         }
 
-        // AGC: normalize block RMS to a gentle target, smoothed to avoid pumping
+        // AGC
         var rms: Float = 0
         vDSP_rmsqv(ifftReal, 1, &rms, vDSP_Length(fftSize))
         if rms > 1e-6 {
             var target = agcTargetRMS / rms
-            // constrain instantaneous correction
             target = max(0.25, min(4.0, target))
             agcGain = agcAlpha * agcGain + (1 - agcAlpha) * target
             vDSP_vsmul(ifftReal, 1, &agcGain, &ifftReal, 1, vDSP_Length(fftSize))
         }
 
-        // Master makeup gain (post-AGC, pre-limiter)
+        // Makeup + limiter
         var makeup: Float = powf(10.0, outputGainDB / 20.0)
         vDSP_vsmul(ifftReal, 1, &makeup, &ifftReal, 1, vDSP_Length(fftSize))
-
-        // Safety limiter (pre-pan)
         var peak: Float = 0
         vDSP_maxmgv(ifftReal, 1, &peak, vDSP_Length(fftSize))
         if peak > 0.95 {
@@ -285,7 +423,7 @@ final class SpectralAudioEngine: ObservableObject {
 
         // Constant-power pan
         let theta = (pan + 1) * Float.pi * 0.25
-        let gL = sin(theta) // flipped earlier so L→R matches visual
+        let gL = sin(theta)
         let gR = cos(theta)
 
         // OLA write
@@ -309,94 +447,56 @@ final class SpectralAudioEngine: ObservableObject {
         }
     }
 
-    // MARK: Generators
-
-    private func genSquare() {
-        let sr = Float(sampleRate)
-        let dphi = 2 * Float.pi * freq / sr
-        var ph = phase
+    private func genWhite() {
         for i in 0..<fftSize {
-            ph += dphi; if ph >= 2 * .pi { ph -= 2 * .pi }
-            timeBlock[i] = (ph < .pi) ? 1 : -1
-        }
-        phase = ph
-    }
-
-    private func genPink() {
-        // Filtered white noise (approx 1/f)
-        for i in 0..<fftSize {
-            let w: Float = Float.random(in: -1...1)
-            p0 = 0.99886 * p0 + 0.0555179 * w
-            p1 = 0.99332 * p1 + 0.0750759 * w
-            p2 = 0.96900 * p2 + 0.1538520 * w
-            // final mix; small white to flatten top
-            let y = p0 + p1 + p2 + 0.3104856 * w
-            timeBlock[i] = y * 0.25 // tame level
-        }
-    }
-
-    private func genHermitianNoiseSpectrum() {
-        // Create complex spectrum with Hermitian symmetry for real time signal
-        let half = fftSize / 2
-        let nyq  = Float(sampleRate / 2)
-        let binHz = nyq / Float(half)
-
-        // DC and Nyquist real, imag=0
-        freqReal[0] = 0;      freqImag[0] = 0
-        freqReal[half] = 0;   freqImag[half] = 0
-
-        for i in 1..<half {
-            // gaussian-ish noise via Box-Muller
-            let u1 = max(1e-12, Float.random(in: 0..<1))
-            let u2 = Float.random(in: 0..<1)
-            let mag = sqrtf(-2 * logf(u1))
-            var re = mag * cosf(2 * .pi * u2)
-            var im = mag * sinf(2 * .pi * u2)
-
-            // keep flat spectrum here; shaping happens later
-            _ = Float(i) * binHz // f (unused)
-            // no shelf
-
-            freqReal[i] = re
-            freqImag[i] = im
-            // Mirror
-            let j = fftSize - i
-            freqReal[j] =  re
-            freqImag[j] = -im
+            timeBlock[i] = Float.random(in: -1...1) * 0.35
         }
     }
 
     private func applySpectralShaping() {
+        guard bandEdges.count == numBands + 1, !binToBand.isEmpty else { return }
         let half = fftSize / 2
         let nyq  = Float(sampleRate / 2)
         let binHz = nyq / Float(half)
 
-        for i in 0...half {
-            // Choose gain for this bin
-            let band = binToBand[i]
-            let gBand = currentGains[min(max(band, 0), numBands - 1)]
+        // DC
+        do {
+            let band = max(0, min(binToBand[0], numBands - 1))
+            let f0 = bandEdges[band], f1 = bandEdges[min(band + 1, numBands)]
+            let fc = sqrtf(max(10, f0) * max(10, f1))
+            let tri = max(0, 1 - (fc / max(60, (f1 - f0)) * 2)) // small weight
+            let gAtt = min(1.0, max(0.05, currentGains[band]))
+            let boost = 1.0 + (targetBoostLin - 1.0) * targetBoostBands[band]
+            let w = gAtt * tri * boost
+            freqReal[0] *= w; freqImag[0] *= w
+        }
 
-            // Simple triangular "gammatone-ish" weighting around band center
-            let f = Float(i) * binHz
-            let f0 = bandEdges[band]
-            let f1 = bandEdges[min(band + 1, numBands)]
-            let fcBand = sqrtf(f0 * f1)           // geometric mean
-            let bw = max(60, (f1 - f0))           // Hz
-            let tri = max(0, 1 - abs(f - fcBand) / (bw * 0.5))
+        // 1 … half-1 with mirror
+        if half > 1 {
+            for i in 1..<(half) {
+                let band = max(0, min(binToBand[i], numBands - 1))
+                let gBand = currentGains[band]
+                let f = Float(i) * binHz
+                let f0 = bandEdges[band]
+                let f1 = bandEdges[min(band + 1, numBands)]
+                let fcBand = sqrtf(max(10, f0) * max(10, f1))
+                let bw = max(60, (f1 - f0))
+                let tri = max(0, 1 - abs(f - fcBand) / (bw * 0.5))
+                let gAtt = min(1.0, max(0.05, gBand))
+                let boost = 1.0 + (targetBoostLin - 1.0) * targetBoostBands[band]
+                let w = gAtt * tri * boost
 
-            // No LPF for now; rely purely on the 40-band envelope
-            let gAtt = min(1.0, max(0.05, gBand))
-            let w = gAtt * tri
-
-            // +freq
-            freqReal[i] *= w
-            freqImag[i] *= w
-            // mirror (avoid double at DC/Nyq)
-            if i != 0 && i != half {
+                freqReal[i] *= w; freqImag[i] *= w
                 let j = fftSize - i
-                freqReal[j] *= w
-                freqImag[j] *= w
+                freqReal[j] *= w; freqImag[j] *= w
             }
         }
+
+        // Nyquist
+        let bandN = max(0, min(binToBand[half], numBands - 1))
+        let gN = min(1.0, max(0.05, currentGains[bandN]))
+        let boostN = 1.0 + (targetBoostLin - 1.0) * targetBoostBands[half < binToBand.count ? bandN : (numBands - 1)]
+        let wN = gN * boostN
+        freqReal[half] *= wN; freqImag[half] *= wN
     }
 }
