@@ -63,6 +63,12 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     // FPS measure
     private var lastTime = Date()
     private var frameCount = 0
+    
+    // ===== PERFORMANCE: Overlay throttling =====
+    private var lastOverlayUpdateTime: TimeInterval = 0
+    private let overlayUpdateInterval: TimeInterval = 0.1  // Max 10 Hz UI updates
+    private var lastDebugPrintTime: TimeInterval = 0
+    private let debugPrintInterval: TimeInterval = 0.5     // Throttle debug prints
 
     func attach(to container: UIView) {
         let config = ARWorldTrackingConfiguration()
@@ -114,11 +120,19 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
 
         // Target coverage in this column (0..1 of vertical cells belonging to targetClass)
         let targetCov = columnTargetCoverage(col: col)
-        print("scan col \(col), targetCov = \(targetCov)")
+        
+        // THROTTLED debug print
+        let now = CACurrentMediaTime()
+        if now - lastDebugPrintTime > debugPrintInterval {
+            lastDebugPrintTime = now
+            print("scan col \(col), targetCov = \(String(format: "%.2f", targetCov)), shape = \(shapeId)")
+        }
 
         // Optional debug print to show when a target is active in this column
-        if shapeId != 0 {
-            print("target active col \(col): shape \(shapeId), bands set: \(targetMask.enumerated().filter{ $0.element > 0 }.map{ $0.offset })")
+        // (also throttled to avoid spam)
+        if shapeId != 0 && now - lastDebugPrintTime > debugPrintInterval {
+            let activeBands = targetMask.enumerated().filter{ $0.element > 0 }.map{ $0.offset }
+            print("target active col \(col): shape \(shapeId), bands: \(activeBands.count)")
         }
 
         // Simple target-based boost: when target coverage is high, pull z01 slightly "closer"
@@ -128,10 +142,17 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
 
         onColumn?(col, env, targetMask, Int(shapeId), pan, z01, edge01)
 
-        if let img = debugImageFromGrid() { debugImage = img }
+        // THROTTLED UI update - only update debugImage at ~10Hz max
+        if now - lastOverlayUpdateTime > overlayUpdateInterval {
+            lastOverlayUpdateTime = now
+            if let img = debugImageFromGrid() {
+                DispatchQueue.main.async {
+                    self.debugImage = img
+                }
+            }
+        }
     }
-    /// Build a per-band (40) mask for targetClass coverage in this column,
-    /// and return the dominant non-background class id seen in the column (0 if none).
+    
     private func columnTargetMaskAndShape(col: Int, bands: Int = DepthPipeline.gridHeight) -> ([Float], UInt8) {
         let W = Self.gridWidth
         let H = Self.gridHeight
@@ -140,14 +161,10 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
 
         gridLock.lock(); defer { gridLock.unlock() }
 
+        // Build histogram of all classes in this column
         for y in 0..<H {
             let cls = Int(classGrid[y * W + col])
             if cls >= 0 && cls < hist.count { hist[cls] += 1 }
-            if classGrid[y * W + col] == targetClass {
-                // map image row y to band index rBand where 0 = bottom
-                let rBand = (H - 1 - y)
-                if rBand >= 0 && rBand < bands { mask[rBand] = 1.0 }
-            }
         }
 
         // Choose dominant non-background class id
@@ -160,13 +177,18 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
             }
         }
 
-        // If there is effectively no target coverage, zero the mask so audio can clear target
-        if !mask.contains(where: { $0 > 0 }) { shapeId = 0 }
+        
+        if shapeId != 0 {
+            for y in 0..<H {
+                if classGrid[y * W + col] == shapeId {
+                    let rBand = (H - 1 - y)
+                    if rBand >= 0 && rBand < bands { mask[rBand] = 1.0 }
+                }
+            }
+        }
 
         return (mask, shapeId)
     }
-
-
     // MARK: ARSessionDelegate
 
     private func handleFrame(_ frame: ARFrame) {
@@ -190,11 +212,14 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
             lastTime = now
         }
 
-        // Update published overlay from the current debug grid render
-        if let img = debugImageFromGrid() {
-            DispatchQueue.main.async {
-                self.segOverlay = img
-                self.debugImage = img
+        // THROTTLED: Update segOverlay at reduced rate (moved from every frame)
+        let currentTime = CACurrentMediaTime()
+        if currentTime - lastOverlayUpdateTime > overlayUpdateInterval {
+            // Note: debugImage is updated in step(), segOverlay updated here
+            if let img = debugImageFromGrid() {
+                DispatchQueue.main.async {
+                    self.segOverlay = img
+                }
             }
         }
     }
@@ -292,6 +317,20 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         gridLock.unlock()
 
         // DEBUG: class distribution in the 60x40 grid (4 classes)
+        // THROTTLED to avoid excessive logging
+        let now = CACurrentMediaTime()
+        if now - lastDebugPrintTime > debugPrintInterval {
+            var hist = [Int](repeating: 0, count: 4)
+            for v in newGrid {
+                let idx = Int(v)
+                if idx >= 0 && idx < hist.count {
+                    hist[idx] += 1
+                }
+            }
+            print("classGrid histogram (bg, sphere, tetra, cube):", hist)
+        }
+        
+        // Update published text for UI (always, it's just a string)
         var hist = [Int](repeating: 0, count: 4)
         for v in newGrid {
             let idx = Int(v)
@@ -299,9 +338,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                 hist[idx] += 1
             }
         }
-        print("classGrid histogram (bg, sphere, tetra, cube):", hist)
-        
-        // Update published text for UI
         DispatchQueue.main.async {
             self.classHistogramText = "bg: \(hist[0])  sp: \(hist[1])  te: \(hist[2])  cu: \(hist[3])"
         }
@@ -372,7 +408,8 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         var countTarget = 0
         for y in 0..<H {
             let idx = y * W + col
-            if classGrid[idx] == targetClass {
+            // Count ANY non-background class, not just targetClass
+            if classGrid[idx] != 0 {
                 countTarget += 1
             }
         }
