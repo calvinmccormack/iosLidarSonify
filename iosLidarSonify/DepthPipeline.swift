@@ -38,6 +38,16 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     // Class IDs per 60x40 cell (from segmentation)
     private var classGrid = [UInt8](repeating: 0, count: gridWidth * gridHeight)
 
+    private let rotateSegMask90CW: Bool = true
+    // Mirror the segmentation grid writeout so classGrid aligns with camera view.
+    // This affects BOTH the debug overlay and all downstream logic (sweep, target coverage).
+    private let mirrorSegX: Bool = true   // horizontal mirror
+    private let mirrorSegY: Bool = true   // vertical mirror
+
+    // Leave overlay flips off to avoid double mirroring in the rendered image.
+    private let overlayFlipX: Bool = false
+    private let overlayFlipY: Bool = false
+
     // Target class for object-aware sonification (placeholder)
     var targetClass: UInt8 = 1
 
@@ -179,18 +189,44 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         var newGrid = [UInt8](repeating: 0, count: Self.gridWidth * Self.gridHeight)
 
         for gy in 0..<Self.gridHeight {
-            let y0 = gy * H / Self.gridHeight
-            let y1 = min((gy + 1) * H / Self.gridHeight, H)
-
             for gx in 0..<Self.gridWidth {
-                let x0 = gx * W / Self.gridWidth
-                let x1 = min((gx + 1) * W / Self.gridWidth, W)
 
-                // Majority vote for class in this cell (our model: 4 classes = bg/sphere/tetra/cube)
                 var counts = [Int](repeating: 0, count: 4)
-                var yy = y0
-                while yy < y1 {
-                    var xx = x0
+
+                if rotateSegMask90CW {
+                    // --- Downsample a 90°-CW-rotated view of the mask (do not rotate the final image) ---
+                    // Rotated view has width H and height W.
+                    let rx0 = gx * H / Self.gridWidth
+                    let rx1 = min((gx + 1) * H / Self.gridWidth, H)
+                    let ry0 = gy * W / Self.gridHeight
+                    let ry1 = min((gy + 1) * W / Self.gridHeight, W)
+
+                    var ry = ry0
+                    while ry < ry1 {
+                        var rx = rx0
+                        while rx < rx1 {
+                            // pure 90° CW rotation (no extra horizontal flip)
+                            let xOrig = ry
+                            let yOrig = (H - 1 - rx)
+                            let idx = yOrig * W + xOrig
+                            let cls = Int(mask[idx])
+                            if cls >= 0 && cls < counts.count {
+                                counts[cls] += 1
+                            }
+                            rx += 1
+                        }
+                        ry += 1
+                    }
+                } else {
+                    // --- No rotation: original orientation ---
+                    let x0 = gx * W / Self.gridWidth
+                    let x1 = min((gx + 1) * W / Self.gridWidth, W)
+                    let y0 = gy * H / Self.gridHeight
+                    let y1 = min((gy + 1) * H / Self.gridHeight, H)
+
+                    var yy = y0
+                    while yy < y1 {
+                        var xx = x0
                         while xx < x1 {
                             let cls = Int(mask[yy * W + xx])
                             if cls >= 0 && cls < counts.count {
@@ -199,10 +235,14 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                             xx += 1
                         }
                         yy += 1
+                    }
                 }
 
                 let (bestClass, _) = counts.enumerated().max(by: { $0.element < $1.element }) ?? (0, 0)
-                newGrid[gy * Self.gridWidth + gx] = UInt8(bestClass)
+                // Write into possibly mirrored destination cell so the 60x40 class grid matches the camera view.
+                let dstX = mirrorSegX ? (Self.gridWidth  - 1 - gx) : gx
+                let dstY = mirrorSegY ? (Self.gridHeight - 1 - gy) : gy
+                newGrid[dstY * Self.gridWidth + dstX] = UInt8(bestClass)
             }
         }
 
@@ -270,7 +310,7 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         for r in 0..<Self.gridHeight {
             // flip vertically so index 0 = bottom
             let gy = (Self.gridHeight - 1 - r)
-            let d = grid[gy * Self.gridWidth + (Self.gridWidth - 1 - col)]
+            let d = grid[gy * Self.gridWidth + col]
             // Normalize depth: near→1, far→0 (invert because nearer = louder)
             let t = clamp01(1 - (d - nearMeters) / max(0.001, (farMeters - nearMeters)))
             // Map to linear gain via dB range (0 dB down to -gainRangeDB)
@@ -283,16 +323,14 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     private func columnTargetCoverage(col: Int) -> Float {
-        // Mirror horizontally to match columnEnvelope’s mirroring
         let W = Self.gridWidth
         let H = Self.gridHeight
-        let cm = (W - 1 - col)
 
         gridLock.lock(); defer { gridLock.unlock() }
 
         var countTarget = 0
         for y in 0..<H {
-            let idx = y * W + cm
+            let idx = y * W + col
             if classGrid[idx] == targetClass {
                 countTarget += 1
             }
@@ -301,15 +339,13 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     private func columnZ01(col: Int) -> Float {
-        // Mirror horizontally to match columnEnvelope’s mirroring
         let W = Self.gridWidth
         let H = Self.gridHeight
-        let cm = (W - 1 - col)
         gridLock.lock(); defer { gridLock.unlock() }
         var acc: Float = 0
         let range = max(0.001, (farMeters - nearMeters))
         for y in 0..<H {
-            let d = grid[y * W + cm]
+            let d = grid[y * W + col]
             let t = clamp01((d - nearMeters) / range) // 0 near → 1 far
             acc += t
         }
@@ -317,15 +353,13 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     private func columnEdge01(col: Int) -> Float {
-        // Mirror horizontally to match columnEnvelope’s mirroring
         let W = Self.gridWidth
         let H = Self.gridHeight
-        let cm = (W - 1 - col)
-        let c1 = min(W - 1, cm + 1)
+        let c1 = min(W - 1, col + 1)
         gridLock.lock(); defer { gridLock.unlock() }
         var acc: Float = 0
         for y in 0..<H {
-            let a = grid[y * W + cm]
+            let a = grid[y * W + col]
             let b = grid[y * W + c1]
             acc += abs(b - a)
         }
@@ -352,7 +386,6 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         // Render 60x40: grayscale depth, with non-background segmentation cells tinted blue
         let W = Self.gridWidth
         let H = Self.gridHeight
-        let scale: CGFloat = 4
 
         // Build RGBA buffer
         var rgba = [UInt8](repeating: 0, count: W * H * 4)
@@ -407,6 +440,24 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         }
         gridLock.unlock()
 
+        // Apply requested flips to the overlay buffer so it aligns with the UI camera view
+        if overlayFlipX || overlayFlipY {
+            var flipped = [UInt8](repeating: 0, count: rgba.count)
+            for y in 0..<H {
+                for x in 0..<W {
+                    let sx = overlayFlipX ? (W - 1 - x) : x
+                    let sy = overlayFlipY ? (H - 1 - y) : y
+                    let sIdx = (sy * W + sx) * 4
+                    let dIdx = (y * W + x) * 4
+                    flipped[dIdx + 0] = rgba[sIdx + 0] // R
+                    flipped[dIdx + 1] = rgba[sIdx + 1] // G
+                    flipped[dIdx + 2] = rgba[sIdx + 2] // B
+                    flipped[dIdx + 3] = rgba[sIdx + 3] // A
+                }
+            }
+            rgba = flipped
+        }
+
         let bytesPerRow = W * 4
         let cfData = CFDataCreate(nil, rgba, rgba.count)!
         let provider = CGDataProvider(data: cfData)!
@@ -424,8 +475,8 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
                             decode: nil,
                             shouldInterpolate: false,
                             intent: .defaultIntent) {
-            // scale is handled by UIKit when drawing; keep 1.0 here
-            return UIImage(cgImage: cg, scale: 1.0 / scale, orientation: .up)
+            // No longer rotate overlay when displayed
+            return UIImage(cgImage: cg, scale: UIScreen.main.scale, orientation: .up)
         }
         return nil
     }
