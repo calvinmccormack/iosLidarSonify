@@ -94,7 +94,7 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         let phase = (t.truncatingRemainder(dividingBy: period) + period)
                      .truncatingRemainder(dividingBy: period) / period
 
-        // FIX: LEFT → RIGHT scan (column 0 to 59)
+        // LEFT → RIGHT scan (column 0 to 59)
         let maxCol = Double(Self.gridWidth - 1)
         let col = Int(round(phase * maxCol))  // 0 → 59 as phase goes 0 → 1
         scanColumn = col
@@ -105,9 +105,9 @@ final class DepthPipeline: NSObject, ObservableObject, ARSessionDelegate {
         // Get object mask for current column from classGrid
         let (targetMask, shapeId) = columnTargetMaskAndShape(col: col)
 
-        // Pan: LEFT=-1, RIGHT=+1 (matches visual: left side of screen = left ear)
-        let norm = Double(col) / maxCol  // 0 → 1 as we scan left → right
-        let pan = Float(norm * 2 - 1)    // -1 → +1
+        // Pan: LEFT=-1, RIGHT=+1 (matches red scan: left side of screen == left ear)
+        let norm = Double(col) / maxCol  // 0 -> 1 == left -> right
+        let pan = Float(norm * 2 - 1)    // -1 -> +1
 
         // Depth-based parameters from real-time data
         var z01 = columnZ01(col: col)

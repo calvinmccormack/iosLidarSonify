@@ -12,8 +12,8 @@ final class SpectralAudioEngine: ObservableObject {
     
     // Constants
     private let sampleRate: Double
-    private let blockSize: Int = 512  // Reduced from 1024 for better performance
-    private let hop: Int = 128        // Reduced from 256
+    private let blockSize: Int = 512
+    private let hop: Int = 128
     
     // AGC
     private var agcGain: Float = 1.0
@@ -43,7 +43,7 @@ final class SpectralAudioEngine: ObservableObject {
     private var targetBoostLin: Float = 1.0
     private let targetBoostSmooth: Float = 0.6
     
-    // Simplified comb using IIR biquad for efficiency
+    // Simple comb that doesnt crash
     struct SimpleComb {
         var g: Float
         var M: Int
@@ -142,7 +142,7 @@ final class SpectralAudioEngine: ObservableObject {
     private var clickEnv: Float = 0
     
     // Large pre-generated noise buffer with pseudo-random access
-    // Uses prime number indexing to avoid repetitive patterns
+    // Uses prime number indexing to avoid repetitive patterns, solved problem of random num generators crushing cpu
     private var noiseBuffer = [Float]()
     private var noiseIdx = 0
     private let noisePrimeStep = 7919  // Prime number for pseudo-random access
@@ -151,7 +151,7 @@ final class SpectralAudioEngine: ObservableObject {
         let session = AVAudioSession.sharedInstance()
         self.sampleRate = session.sampleRate
         
-        // Init combs
+        // comb setup
         let sr = Float(sampleRate)
         sphereComb = SimpleComb(g: 0.92, M: Int(sr / 60) + 50)
         tetraComb = SimpleComb(g: 0.88, M: Int(sr / 150) + 50)
@@ -176,8 +176,7 @@ final class SpectralAudioEngine: ObservableObject {
         forwardDFT = vDSP.DFT(previous: nil, count: blockSize, direction: .forward, transformType: .complexReal, ofType: Float.self)!
         inverseDFT = vDSP.DFT(previous: nil, count: blockSize, direction: .inverse, transformType: .complexReal, ofType: Float.self)!
         
-        // Generate large noise buffer (65536 samples ≈ 1.4 seconds @ 48kHz)
-        // Prime number stepping through this creates non-repeating patterns
+        // generate noise buffer
         noiseBuffer = (0..<65536).map { _ in Float.random(in: -0.35...0.35) }
         
         // OLA
@@ -262,7 +261,6 @@ final class SpectralAudioEngine: ObservableObject {
     func setTargetBands(_ mask: [Float], shape: Int, boostDB: Float) {
         guard mask.count == numBands else { return }
         
-        // Update target boost for magical background emphasis
         targetBoostLin = powf(10.0, boostDB / 20.0)
         for i in 0..<numBands {
             targetBoostBands[i] = targetBoostSmooth * targetBoostBands[i] + (1 - targetBoostSmooth) * mask[i]
@@ -393,9 +391,9 @@ final class SpectralAudioEngine: ObservableObject {
             let excScale = 0.25 + smoothedCentroid * 0.25
             
             for i in 0..<blockSize {
-                // Use different phase of noise buffer for excitation
+                
                 let excIdx = (noiseIdx + i * noisePrimeStep) % noiseBuffer.count
-                let exc = noiseBuffer[excIdx] * excScale * 2.85  // Scale to ±1 range
+                let exc = noiseBuffer[excIdx] * excScale * 2.85
                 var add: Float = 0
                 
                 if sphereActive && sphereLevel > 0.01 {
@@ -495,6 +493,7 @@ final class SpectralAudioEngine: ObservableObject {
             let gAtt = min(1.0, max(0.05, gBand))
             
             // Target boost for magical emphasis
+            // sorry, magical sounding noise was cut due to cpu constraints
             let tBoost = targetBoostBands[band]
             let boostFactor = 1.0 + (targetBoostLin - 1.0) * tBoost
             
